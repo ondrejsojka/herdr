@@ -327,9 +327,9 @@ fn focused_terminal_cursor(app_state: &AppState) -> Option<CursorState> {
     // Determine whether the IME-anchor reveal applies to this focused pane.
     // The master switch must be on, and either no agent filter is configured
     // (apply to any pane) or the focused pane's detected agent matches the
-    // allow-list.
+    // allow-list. A configured list with no valid entries reveals nothing.
     let reveal = app_state.reveal_hidden_cursor_for_cjk_ime
-        && (app_state.cjk_ime_agents.is_empty() || {
+        && (!app_state.cjk_ime_agent_filter_configured || {
             let detected = app_state
                 .workspaces
                 .get(ws_idx)

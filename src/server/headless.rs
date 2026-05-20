@@ -2804,6 +2804,7 @@ mod tests {
         state.reveal_hidden_cursor_for_cjk_ime = true;
         // Filter only Claude, but the test pane has no detected agent, so the
         // reveal must not apply.
+        state.cjk_ime_agent_filter_configured = true;
         state.cjk_ime_agents = vec![crate::detect::Agent::Claude];
         let mut ws = crate::workspace::Workspace::test_new("test");
         let pane_id = ws.tabs[0].root_pane;
@@ -2824,6 +2825,34 @@ mod tests {
         assert!(
             cursor.as_ref().is_none_or(|cursor| !cursor.visible),
             "agent filter should suppress reveal when the focused pane's detected agent is not on the list; got {cursor:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn virtual_render_skips_reveal_when_agent_filter_has_no_valid_entries() {
+        let mut state = AppState::test_new();
+        state.reveal_hidden_cursor_for_cjk_ime = true;
+        state.cjk_ime_agent_filter_configured = true;
+        state.cjk_ime_agents = Vec::new();
+        let mut ws = crate::workspace::Workspace::test_new("test");
+        let pane_id = ws.tabs[0].root_pane;
+        ws.insert_test_runtime(
+            pane_id,
+            crate::terminal::TerminalRuntime::test_with_screen_bytes(20, 5, b"left\x1b[?25l"),
+        );
+
+        state.workspaces = vec![ws];
+        state.active = Some(0);
+        state.selected = 0;
+        state.mode = crate::app::Mode::Terminal;
+
+        let area = Rect::new(0, 0, 80, 24);
+        let (_buffer, cursor) =
+            crate::server::render_stream::render_virtual(&mut state, area, true);
+
+        assert!(
+            cursor.as_ref().is_none_or(|cursor| !cursor.visible),
+            "agent filter with no valid entries should suppress reveal; got {cursor:?}",
         );
     }
 

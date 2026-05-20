@@ -209,6 +209,7 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # reveal_hidden_cursor_for_cjk_ime = false
 # Optional allow-list: only reveal for focused panes whose detected agent
 # matches one of these names. Empty means apply to any focused pane.
+# If the list contains no valid names, the reveal does not apply.
 # Accepted: pi, claude, codex, gemini, cursor, cline, opencode, copilot,
 # kimi, kiro, droid, amp, grok, hermes.
 # cjk_ime_agents = []

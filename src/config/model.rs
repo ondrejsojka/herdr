@@ -265,7 +265,8 @@ pub struct ExperimentalConfig {
     pub reveal_hidden_cursor_for_cjk_ime: bool,
     /// Restrict `reveal_hidden_cursor_for_cjk_ime` to focused panes whose
     /// detected agent matches one of these names (case-insensitive). Empty
-    /// list means apply to any focused pane. Unknown agent names are ignored.
+    /// list means apply to any focused pane. Unknown agent names are ignored;
+    /// if the list contains no valid names, the reveal does not apply.
     /// Accepted names: pi, claude, codex, gemini, cursor, cline, opencode,
     /// copilot, kimi, kiro, droid, amp, grok, hermes. Default: empty.
     pub cjk_ime_agents: Vec<String>,

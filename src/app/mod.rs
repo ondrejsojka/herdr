@@ -428,6 +428,7 @@ impl App {
             prompt_new_tab_name: config.ui.prompt_new_tab_name,
             show_agent_labels_on_pane_borders: config.ui.show_agent_labels_on_pane_borders,
             reveal_hidden_cursor_for_cjk_ime: config.experimental.reveal_hidden_cursor_for_cjk_ime,
+            cjk_ime_agent_filter_configured: !config.experimental.cjk_ime_agents.is_empty(),
             cjk_ime_agents: parse_cjk_ime_agents(&config.experimental.cjk_ime_agents),
             cjk_ime_cursor_shape: config.experimental.cjk_ime_cursor_shape.to_decscusr(),
             kitty_graphics_enabled: config.experimental.kitty_graphics,
@@ -907,6 +908,8 @@ impl App {
             }
             self.state.reveal_hidden_cursor_for_cjk_ime =
                 config.experimental.reveal_hidden_cursor_for_cjk_ime;
+            self.state.cjk_ime_agent_filter_configured =
+                !config.experimental.cjk_ime_agents.is_empty();
             self.state.cjk_ime_agents = parse_cjk_ime_agents(&config.experimental.cjk_ime_agents);
             self.state.cjk_ime_cursor_shape =
                 config.experimental.cjk_ime_cursor_shape.to_decscusr();
