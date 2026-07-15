@@ -56,6 +56,13 @@ impl ClientRenderState {
         }
     }
 
+    pub(crate) fn reset_transport_generation(&mut self) {
+        self.reset_baseline();
+        if let Self::TerminalAnsi { seq, .. } = self {
+            *seq = 0;
+        }
+    }
+
     pub(crate) fn reset_semantic_input_baseline(&mut self) {
         if let Self::Semantic { last_frame } = self {
             *last_frame = None;
