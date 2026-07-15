@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+### Added
+- `herdr --remote` now uses SSH-authenticated, certificate-pinned QUIC with bounded render/control queues, resumable path recovery, full-redraw and Kitty graphics reconstruction, automatic SSH rebootstrap, and transparent SSH stdio fallback. Configure the policy with `remote.transport`, `remote.quic_port_range`, `remote.quic_idle_timeout_seconds`, and `remote.ssh_fallback`.
+
 ## [0.7.4] - 2026-07-15
 
 ### Added
