@@ -38,11 +38,11 @@ const MIN_CLIENT_ROWS: u16 = 1;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(4);
 
 /// Maximum input payload size (bytes) for a single `ClientMessage::Input`.
-const MAX_INPUT_PAYLOAD: usize = 1024 * 1024; // 1 MB
+pub(crate) const MAX_INPUT_PAYLOAD: usize = 1024 * 1024; // 1 MB
 /// Maximum structured input events accepted in one client message.
-const MAX_INPUT_EVENT_BATCH: usize = 4096;
+pub(crate) const MAX_INPUT_EVENT_BATCH: usize = 4096;
 /// Maximum encoded mouse report accepted with pixel geometry.
-const MAX_PIXEL_MOUSE_PAYLOAD: usize = 128;
+pub(crate) const MAX_PIXEL_MOUSE_PAYLOAD: usize = 128;
 
 /// Channels owned by the server side of a client writer thread.
 #[derive(Clone, Debug)]
@@ -54,8 +54,30 @@ pub(crate) struct ClientWriter {
 }
 
 impl ClientWriter {
+    #[cfg(unix)]
+    pub(crate) fn quic(
+        control: crate::server::remote_quic::QuicControlSender,
+        render: crate::server::remote_quic::QuicRenderSender,
+    ) -> Self {
+        Self {
+            control: ClientControlWriter {
+                target: ClientControlTarget::Quic(control),
+            },
+            render: ClientRenderWriter {
+                target: ClientRenderTarget::Quic(render),
+            },
+        }
+    }
+
     pub(crate) fn replace_with_cleanup(&self, data: Vec<u8>) {
-        self.render.queue.replace_with_cleanup(data);
+        match &self.render.target {
+            ClientRenderTarget::Queue(queue) => queue.replace_with_cleanup(data),
+            #[cfg(unix)]
+            ClientRenderTarget::Quic(_) => {
+                self.render.reset_generation();
+                let _ = self.control.send(data);
+            }
+        }
     }
 
     #[cfg(test)]
@@ -65,7 +87,9 @@ impl ClientWriter {
 
     #[cfg(test)]
     pub(crate) fn test_close(&self) {
-        self.render.queue.close_writer();
+        if let ClientRenderTarget::Queue(queue) = &self.render.target {
+            queue.close_writer();
+        }
     }
 
     #[cfg(test)]
@@ -75,12 +99,9 @@ impl ClientWriter {
     ) -> Self {
         let queue = ClientWriterQueue::new();
         let drain = queue.clone();
-        let control_writer = ClientControlWriter::queue(queue.clone());
-        let mut render_writer = ClientRenderWriter::queue(queue);
-        render_writer.test_render = Some(render.clone());
         let writer = Self {
-            control: control_writer,
-            render: render_writer,
+            control: ClientControlWriter::queue(queue.clone()),
+            render: ClientRenderWriter::queue(queue),
         };
         std::thread::spawn(move || {
             while let Some(item) = drain.recv() {
@@ -100,52 +121,96 @@ impl ClientWriter {
 
 #[derive(Debug)]
 pub(crate) struct ClientControlWriter {
-    queue: Arc<ClientWriterQueue>,
-    #[cfg(test)]
-    test_render: Option<std::sync::mpsc::SyncSender<Vec<u8>>>,
+    target: ClientControlTarget,
+}
+
+#[derive(Debug)]
+enum ClientControlTarget {
+    Queue(Arc<ClientWriterQueue>),
+    #[cfg(unix)]
+    Quic(crate::server::remote_quic::QuicControlSender),
 }
 
 #[derive(Debug)]
 pub(crate) struct ClientRenderWriter {
-    queue: Arc<ClientWriterQueue>,
-    #[cfg(test)]
-    test_render: Option<std::sync::mpsc::SyncSender<Vec<u8>>>,
+    target: ClientRenderTarget,
 }
 
-macro_rules! writer_handle {
-    ($type:ty) => {
-        impl Clone for $type {
-            fn clone(&self) -> Self {
-                self.queue.add_sender();
+#[derive(Debug)]
+enum ClientRenderTarget {
+    Queue(Arc<ClientWriterQueue>),
+    #[cfg(unix)]
+    Quic(crate::server::remote_quic::QuicRenderSender),
+}
+
+impl Clone for ClientControlWriter {
+    fn clone(&self) -> Self {
+        match &self.target {
+            ClientControlTarget::Queue(queue) => {
+                queue.add_sender();
                 Self {
-                    queue: self.queue.clone(),
-                    #[cfg(test)]
-                    test_render: self.test_render.clone(),
+                    target: ClientControlTarget::Queue(queue.clone()),
                 }
             }
+            #[cfg(unix)]
+            ClientControlTarget::Quic(sender) => Self {
+                target: ClientControlTarget::Quic(sender.clone()),
+            },
         }
-        impl Drop for $type {
-            fn drop(&mut self) {
-                self.queue.remove_sender();
-            }
-        }
-    };
+    }
 }
-writer_handle!(ClientControlWriter);
-writer_handle!(ClientRenderWriter);
+
+impl Drop for ClientControlWriter {
+    fn drop(&mut self) {
+        match &self.target {
+            ClientControlTarget::Queue(queue) => queue.remove_sender(),
+            #[cfg(unix)]
+            ClientControlTarget::Quic(_) => {}
+        }
+    }
+}
 
 impl ClientControlWriter {
     fn queue(queue: Arc<ClientWriterQueue>) -> Self {
         queue.add_sender();
         Self {
-            queue,
-            #[cfg(test)]
-            test_render: None,
+            target: ClientControlTarget::Queue(queue),
         }
     }
 
     pub(crate) fn send(&self, data: Vec<u8>) -> Result<(), SendError<Vec<u8>>> {
-        self.queue.send_control(data)
+        match &self.target {
+            ClientControlTarget::Queue(queue) => queue.send_control(data),
+            #[cfg(unix)]
+            ClientControlTarget::Quic(sender) => sender.send(data),
+        }
+    }
+}
+
+impl Clone for ClientRenderWriter {
+    fn clone(&self) -> Self {
+        match &self.target {
+            ClientRenderTarget::Queue(queue) => {
+                queue.add_sender();
+                Self {
+                    target: ClientRenderTarget::Queue(queue.clone()),
+                }
+            }
+            #[cfg(unix)]
+            ClientRenderTarget::Quic(sender) => Self {
+                target: ClientRenderTarget::Quic(sender.clone()),
+            },
+        }
+    }
+}
+
+impl Drop for ClientRenderWriter {
+    fn drop(&mut self) {
+        match &self.target {
+            ClientRenderTarget::Queue(queue) => queue.remove_sender(),
+            #[cfg(unix)]
+            ClientRenderTarget::Quic(_) => {}
+        }
     }
 }
 
@@ -153,22 +218,31 @@ impl ClientRenderWriter {
     fn queue(queue: Arc<ClientWriterQueue>) -> Self {
         queue.add_sender();
         Self {
-            queue,
-            #[cfg(test)]
-            test_render: None,
+            target: ClientRenderTarget::Queue(queue),
         }
     }
 
     pub(crate) fn try_send(&self, data: Vec<u8>) -> Result<(), TrySendError<Vec<u8>>> {
-        #[cfg(test)]
-        if let Some(sender) = &self.test_render {
-            return sender.try_send(data);
+        match &self.target {
+            ClientRenderTarget::Queue(queue) => queue.try_send_render(data),
+            #[cfg(unix)]
+            ClientRenderTarget::Quic(sender) => sender.try_send(data),
         }
-        self.queue.try_send_render(data)
     }
 
     pub(crate) fn send_ordered(&self, data: Vec<u8>) -> Result<(), TrySendError<Vec<u8>>> {
-        self.queue.send_ordered(data)
+        match &self.target {
+            ClientRenderTarget::Queue(queue) => queue.send_ordered(data),
+            #[cfg(unix)]
+            ClientRenderTarget::Quic(sender) => sender.try_send(data),
+        }
+    }
+
+    pub(crate) fn reset_generation(&self) {
+        #[cfg(unix)]
+        if let ClientRenderTarget::Quic(sender) = &self.target {
+            sender.reset_generation();
+        }
     }
 }
 
@@ -393,6 +467,13 @@ pub(crate) enum ServerEvent {
     ClientDisconnected { client_id: u64 },
     /// A client writer drained its render slot and can accept another render.
     ClientWriterDrained { client_id: u64 },
+    /// An authenticated local helper requested a process-lifetime QUIC capability.
+    RemoteBootstrap {
+        request: crate::protocol::RemoteBootstrapRequest,
+        respond_to: std::sync::mpsc::Sender<Result<crate::protocol::RemoteBootstrapRecord, String>>,
+    },
+    /// A live remote client requested a fresh full render generation.
+    ClientSyncRequest { client_id: u64 },
     /// Ctrl+C or external shutdown signal received.
     QuitSignal,
 }
@@ -403,8 +484,7 @@ pub(crate) fn clamp_terminal_size(cols: u16, rows: u16) -> (u16, u16) {
     let clamped_rows = rows.max(MIN_CLIENT_ROWS);
     (clamped_cols, clamped_rows)
 }
-
-fn parse_client_keybindings(
+pub(crate) fn parse_client_keybindings(
     keybindings: ClientKeybindings,
 ) -> Result<Option<Box<crate::config::LiveKeybindConfig>>, String> {
     match keybindings {
@@ -552,6 +632,38 @@ pub(crate) fn handle_client_handshake(
             debug!(client_id, err = %err, "failed to read client hello");
             return Ok(());
         }
+    };
+
+    let hello = if let ClientMessage::RemoteBootstrap(request) = hello {
+        let (respond_to, response_rx) = std::sync::mpsc::channel();
+        if server_event_tx
+            .blocking_send(ServerEvent::RemoteBootstrap {
+                request,
+                respond_to,
+            })
+            .is_err()
+        {
+            return Ok(());
+        }
+        let response = match response_rx.recv_timeout(HANDSHAKE_TIMEOUT) {
+            Ok(Ok(record)) => ServerMessage::RemoteBootstrap {
+                record: Some(record),
+                error: None,
+            },
+            Ok(Err(error)) => ServerMessage::RemoteBootstrap {
+                record: None,
+                error: Some(error),
+            },
+            Err(_) => ServerMessage::RemoteBootstrap {
+                record: None,
+                error: Some("remote QUIC bootstrap timed out".to_owned()),
+            },
+        };
+        protocol::write_message(&mut stream, &response)
+            .map_err(|err| io::Error::other(err.to_string()))?;
+        return Ok(());
+    } else {
+        hello
     };
 
     let (
@@ -970,8 +1082,17 @@ fn client_read_loop(
                 row,
                 modifiers,
             },
+            ClientMessage::SyncRequest => ServerEvent::ClientSyncRequest { client_id },
+            ClientMessage::RemoteBootstrap(_) => {
+                // Bootstrap is valid only as the first local-socket message.
+                continue;
+            }
             ClientMessage::Hello { .. } => {
                 // Duplicate Hello — ignore.
+                continue;
+            }
+            ClientMessage::RemotePing { .. } => {
+                // Heartbeats are valid only on the QUIC control stream.
                 continue;
             }
         };

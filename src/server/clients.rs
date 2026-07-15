@@ -144,6 +144,11 @@ impl ClientConnection {
         self.render_state.request_repaint();
     }
 
+    pub(crate) fn request_transport_generation_redraw(&mut self) {
+        self.render_state.reset_transport_generation();
+        self.graphics_surface_reset_pending = true;
+    }
+
     pub(crate) fn deferred_render(&self) -> DeferredRender {
         if self.render_pending {
             DeferredRender::Full

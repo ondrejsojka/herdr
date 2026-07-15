@@ -1,4 +1,12 @@
 mod attach;
+#[cfg(all(test, unix))]
+mod benchmark;
+
+#[cfg(unix)]
+mod quic;
+
+#[cfg(unix)]
+mod proxy;
 #[cfg(unix)]
 mod host_unix;
 
@@ -10,6 +18,13 @@ pub(crate) use host_unix::run_remote_client_bridge;
 pub(crate) fn run_remote_client_bridge() -> std::io::Result<()> {
     Err(std::io::Error::other(
         "remote Windows hosts are not supported yet",
+    ))
+}
+
+#[cfg(windows)]
+pub(crate) fn run_remote_quic_bootstrap(_logical_client_id: Option<&str>) -> std::io::Result<()> {
+    Err(std::io::Error::other(
+        "remote QUIC bootstrap is not supported on Windows yet",
     ))
 }
 

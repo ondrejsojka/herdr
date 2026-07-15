@@ -35,6 +35,9 @@ pub use self::{
     theme::{parse_color, CustomThemeColors, ThemeConfig, THEME_NAMES},
 };
 
+#[cfg(unix)]
+pub use self::model::{RemoteConfig, RemoteTransportConfig};
+
 pub(crate) use self::keybinds::parse_key_combo;
 pub(crate) use self::{
     io::upsert_top_level_bool,

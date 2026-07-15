@@ -4,6 +4,8 @@ use super::shell_quote;
 use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::{self, IsTerminal, Write as _};
+use std::net::{SocketAddr, ToSocketAddrs};
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
@@ -173,11 +175,9 @@ pub(crate) fn run_remote(remote: RemoteLaunch) -> io::Result<()> {
         remote.keybindings,
         remote.live_handoff,
     );
-    let manage_ssh_config = crate::config::Config::load()
-        .config
-        .remote
-        .manage_ssh_config;
-    let remote_ssh = RemoteSsh::new(remote.target.clone(), manage_ssh_config);
+    let config = crate::config::Config::load().config;
+    let remote_config = config.remote.clone();
+    let remote_ssh = RemoteSsh::new(remote.target.clone(), remote_config.manage_ssh_config);
     let prepared_remote = prepare_remote_herdr(&remote_ssh, remote.live_handoff)?;
     ensure_remote_server_ready(
         &remote_ssh,
@@ -187,17 +187,163 @@ pub(crate) fn run_remote(remote: RemoteLaunch) -> io::Result<()> {
         remote.live_handoff,
     )?;
 
-    let _bridge = SshStdioBridge::start(
-        remote.target,
-        prepared_remote.remote_herdr,
-        local_socket.clone(),
+    let mut logical_client_id = [0u8; crate::protocol::REMOTE_QUIC_ID_BYTES];
+    getrandom::fill(&mut logical_client_id)
+        .map_err(|error| io::Error::other(format!("failed to create remote client id: {error}")))?;
+    let (ssh_hostname, bootstrap, bootstrap_error) =
+        if remote_config.transport == crate::config::RemoteTransportConfig::Ssh {
+            (None, None, None)
+        } else {
+            match remote_ssh.resolved_hostname() {
+                Ok(hostname) => match request_remote_quic_bootstrap(
+                    &remote.target,
+                    &prepared_remote.remote_herdr,
+                    &session_name,
+                    &logical_client_id,
+                    remote_ssh.options(),
+                ) {
+                    Ok(record) => (Some(hostname), Some(record), None),
+                    Err(error) => (Some(hostname), None, Some(error.to_string())),
+                },
+                Err(error) => (None, None, Some(error.to_string())),
+            }
+        };
+    let _bridge = super::proxy::ResumableRemoteBridge::start(super::proxy::BridgeConfig {
+        target: remote.target,
+        remote_herdr: prepared_remote.remote_herdr,
+        local_socket: local_socket.clone(),
         session_name,
-        remote_ssh.options(),
-    )?;
+        ssh_options: remote_ssh.options().cloned(),
+        remote_config,
+        logical_client_id,
+        ssh_hostname,
+        bootstrap,
+        bootstrap_error,
+    })?;
 
     run_client_process(&local_socket, &reattach_command, remote.keybindings)
 }
 
+pub(crate) fn run_remote_client_bridge() -> io::Result<()> {
+    ensure_remote_server_running()?;
+
+    let socket_path = crate::server::socket_paths::client_socket_path();
+    let stream = UnixStream::connect(&socket_path).map_err(|err| {
+        io::Error::new(
+            err.kind(),
+            format!(
+                "failed to connect to remote Herdr client socket {}: {err}",
+                socket_path.display()
+            ),
+        )
+    })?;
+
+    let mut stdout = io::stdout().lock();
+    let mut socket_to_stdout = stream.try_clone()?;
+    let mut stdin_to_socket = stream;
+
+    let _upload = thread::spawn(move || {
+        let mut stdin = io::stdin();
+        let _ = copy_flush(&mut stdin, &mut stdin_to_socket);
+        let _ = stdin_to_socket.shutdown(std::net::Shutdown::Write);
+    });
+
+    copy_flush(&mut socket_to_stdout, &mut stdout).map(|_| ())
+}
+
+pub(crate) fn run_remote_quic_bootstrap(logical_client_id: Option<&str>) -> io::Result<()> {
+    let logical_client_id = logical_client_id
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing logical client id"))
+        .and_then(parse_logical_client_id)?;
+    ensure_remote_server_running()?;
+
+    let socket_path = crate::server::socket_paths::client_socket_path();
+    let mut stream = UnixStream::connect(&socket_path).map_err(|err| {
+        io::Error::new(
+            err.kind(),
+            format!(
+                "failed to connect to remote Herdr client socket {}: {err}",
+                socket_path.display()
+            ),
+        )
+    })?;
+    let session = crate::session::active_name()
+        .unwrap_or_else(|| crate::session::DEFAULT_SESSION_NAME.to_owned());
+    crate::protocol::write_message(
+        &mut stream,
+        &crate::protocol::ClientMessage::RemoteBootstrap(crate::protocol::RemoteBootstrapRequest {
+            session,
+            logical_client_id,
+        }),
+    )
+    .map_err(|err| io::Error::other(err.to_string()))?;
+    let response: crate::protocol::ServerMessage =
+        crate::protocol::read_message(&mut stream, crate::protocol::MAX_FRAME_SIZE)
+            .map_err(|err| io::Error::other(err.to_string()))?;
+    let record = match response {
+        crate::protocol::ServerMessage::RemoteBootstrap {
+            record: Some(record),
+            error: None,
+        } => record,
+        crate::protocol::ServerMessage::RemoteBootstrap {
+            error: Some(error), ..
+        } => return Err(io::Error::other(error)),
+        _ => return Err(io::Error::other("invalid remote QUIC bootstrap response")),
+    };
+    serde_json::to_writer(io::stdout().lock(), &record)
+        .map_err(|err| io::Error::other(format!("failed to encode QUIC bootstrap: {err}")))?;
+    println!();
+    Ok(())
+}
+
+fn parse_logical_client_id(value: &str) -> io::Result<[u8; crate::protocol::REMOTE_QUIC_ID_BYTES]> {
+    if value.len() != crate::protocol::REMOTE_QUIC_ID_BYTES * 2 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "logical client id must contain 32 hexadecimal characters",
+        ));
+    }
+    let mut bytes = [0u8; crate::protocol::REMOTE_QUIC_ID_BYTES];
+    for (index, output) in bytes.iter_mut().enumerate() {
+        let offset = index * 2;
+        *output = u8::from_str_radix(&value[offset..offset + 2], 16).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "logical client id contains non-hexadecimal characters",
+            )
+        })?;
+    }
+    Ok(bytes)
+}
+
+fn format_logical_client_id(value: &[u8; crate::protocol::REMOTE_QUIC_ID_BYTES]) -> String {
+    let mut encoded = String::with_capacity(crate::protocol::REMOTE_QUIC_ID_BYTES * 2);
+    for byte in value {
+        use std::fmt::Write as _;
+        let _ = write!(encoded, "{byte:02x}");
+    }
+    encoded
+}
+
+fn ensure_remote_server_running() -> io::Result<()> {
+    let socket_path = crate::server::socket_paths::client_socket_path();
+    if crate::server::autodetect::is_server_listening() {
+        let status = crate::api::read_runtime_status_at(
+            &crate::api::socket_path(),
+            Duration::from_millis(500),
+        )?
+        .ok_or_else(|| io::Error::other("remote server status API is unavailable"))?;
+        if status.protocol == Some(CURRENT_PROTOCOL) {
+            return Ok(());
+        }
+        return Err(io::Error::other(
+            "remote herdr server must restart before this bridge can attach; rerun `herdr --remote` from an interactive terminal to approve stopping it",
+        ));
+    }
+
+    crate::server::autodetect::spawn_server_daemon()?;
+    crate::server::autodetect::wait_for_server_socket(&socket_path, Duration::from_secs(5))
+}
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RemotePlatform {
     os: &'static str,
@@ -245,7 +391,7 @@ impl RemotePlatform {
 }
 
 #[derive(Debug, Clone)]
-struct RemoteHerdr {
+pub(super) struct RemoteHerdr {
     install_suffix: String,
     shell_path: String,
     platform: RemotePlatform,
@@ -400,7 +546,7 @@ struct PreparedRemoteHerdr {
 }
 
 #[derive(Clone)]
-struct ManagedSshOptions {
+pub(super) struct ManagedSshOptions {
     config_path: PathBuf,
     control_path: Option<PathBuf>,
 }
@@ -484,6 +630,21 @@ impl RemoteSsh {
 
     fn user_shell_output(&self, command: &str) -> io::Result<Output> {
         self.command().arg(command).output()
+    }
+
+    fn resolved_hostname(&self) -> io::Result<String> {
+        let output = self.base_command().arg("-G").arg(&self.target).output()?;
+        if !output.status.success() {
+            return Err(command_failed("failed to resolve SSH target", &output));
+        }
+        let config = String::from_utf8_lossy(&output.stdout);
+        config
+            .lines()
+            .find_map(|line| line.strip_prefix("hostname "))
+            .map(str::trim)
+            .filter(|hostname| !hostname.is_empty())
+            .map(str::to_owned)
+            .ok_or_else(|| io::Error::other("ssh -G did not report a hostname"))
     }
 
     fn install_herdr(&self, remote_herdr: &RemoteHerdr, source_path: &Path) -> io::Result<()> {
@@ -603,7 +764,10 @@ impl Drop for RemoteSsh {
     }
 }
 
-fn apply_managed_ssh_options(command: &mut Command, options: Option<&ManagedSshOptions>) {
+pub(super) fn apply_managed_ssh_options(
+    command: &mut Command,
+    options: Option<&ManagedSshOptions>,
+) {
     let Some(options) = options else {
         return;
     };
@@ -1614,7 +1778,7 @@ fn confirm_remote_install(
     Ok(())
 }
 
-fn remote_bridge_command(remote_herdr: &RemoteHerdr, session_name: &str) -> String {
+pub(super) fn remote_bridge_command(remote_herdr: &RemoteHerdr, session_name: &str) -> String {
     let mut command = format!("exec {}", remote_herdr.shell_path);
     if session_name != crate::session::DEFAULT_SESSION_NAME {
         command.push_str(" --session ");
@@ -1622,6 +1786,59 @@ fn remote_bridge_command(remote_herdr: &RemoteHerdr, session_name: &str) -> Stri
     }
     command.push_str(" remote-client-bridge");
     command
+}
+
+fn remote_quic_bootstrap_command(
+    remote_herdr: &RemoteHerdr,
+    session_name: &str,
+    logical_client_id: &[u8; crate::protocol::REMOTE_QUIC_ID_BYTES],
+) -> String {
+    let mut command = remote_herdr.shell_path.clone();
+    if session_name != crate::session::DEFAULT_SESSION_NAME {
+        command.push_str(" --session ");
+        command.push_str(&shell_quote(session_name));
+    }
+    command.push_str(" remote-quic-bootstrap ");
+    command.push_str(&format_logical_client_id(logical_client_id));
+    command
+}
+
+pub(super) fn request_remote_quic_bootstrap(
+    target: &str,
+    remote_herdr: &RemoteHerdr,
+    session_name: &str,
+    logical_client_id: &[u8; crate::protocol::REMOTE_QUIC_ID_BYTES],
+    ssh_options: Option<&ManagedSshOptions>,
+) -> io::Result<crate::protocol::RemoteBootstrapRecord> {
+    let mut command = Command::new("ssh");
+    apply_managed_ssh_options(&mut command, ssh_options);
+    let output = command
+        .arg("-T")
+        .arg(target)
+        .arg(remote_quic_bootstrap_command(
+            remote_herdr,
+            session_name,
+            logical_client_id,
+        ))
+        .output()?;
+    if !output.status.success() {
+        return Err(command_failed("remote QUIC bootstrap failed", &output));
+    }
+    serde_json::from_slice(&output.stdout)
+        .map_err(|err| io::Error::other(format!("invalid remote QUIC bootstrap response: {err}")))
+}
+
+pub(super) fn remote_quic_candidates(hostname: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
+    let mut candidates = (hostname, port).to_socket_addrs()?.collect::<Vec<_>>();
+    candidates.sort_by_key(|candidate| if candidate.is_ipv6() { 0 } else { 1 });
+    candidates.dedup();
+    if candidates.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::AddrNotAvailable,
+            format!("SSH hostname {hostname} has no IP addresses"),
+        ));
+    }
+    Ok(candidates)
 }
 
 fn reattach_command(
@@ -1757,6 +1974,11 @@ impl Drop for SshStdioBridge {
     }
 }
 
+
+/// Quotes a path for an ssh_config `Include` so a path containing spaces (or
+/// glob metacharacters) is treated as one literal token instead of being split
+/// or expanded by ssh — otherwise the user's config might not be Included and
+/// herdr's fallback would wrongly take effect.
 fn ssh_config_quote(path: &str) -> String {
     format!("\"{path}\"")
 }
@@ -2202,12 +2424,23 @@ mod tests {
             os: "linux",
             arch: "x86_64",
         });
-        let bridge = SshStdioBridge::start(
-            "example".to_string(),
-            remote_herdr,
-            socket.clone(),
-            "default".to_string(),
-            None,
+        let remote_config = crate::config::RemoteConfig {
+            transport: crate::config::RemoteTransportConfig::Ssh,
+            ..Default::default()
+        };
+        let bridge = crate::remote::proxy::ResumableRemoteBridge::start(
+            crate::remote::proxy::BridgeConfig {
+                target: "example".to_owned(),
+                remote_herdr,
+                local_socket: socket.clone(),
+                session_name: "default".to_owned(),
+                ssh_options: None,
+                remote_config,
+                logical_client_id: [0; crate::protocol::REMOTE_QUIC_ID_BYTES],
+                ssh_hostname: None,
+                bootstrap: None,
+                bootstrap_error: None,
+            },
         )
         .expect("start bridge listener");
 
