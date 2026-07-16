@@ -49,6 +49,7 @@
 - Live handoff now preserves installed plugins and no longer lets the next plugin installation overwrite the existing registry. (#893)
 - `herdr agent wait` now returns `agent_not_running` promptly when its target pane closes instead of waiting for the full timeout. (#1439)
 - Pane graphics streams now shut down cleanly when a client disconnect races stream teardown.
+- Mouse-wheel, pane-frame, scrollbar, selection-scroll, and configured right-click passthrough interactions now focus the target pane through the server-owned runtime path; clicking a scrollbar track above its thumb no longer panics.
 
 ## [0.7.4] - 2026-07-15
 
