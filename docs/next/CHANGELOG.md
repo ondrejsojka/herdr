@@ -5,6 +5,9 @@
 ### Added
 - `herdr --remote` now uses SSH-authenticated, certificate-pinned QUIC with bounded render/control queues, resumable path recovery, full-redraw and Kitty graphics reconstruction, automatic SSH rebootstrap, and transparent SSH stdio fallback. Configure the policy with `remote.transport`, `remote.quic_port_range`, `remote.quic_idle_timeout_seconds`, and `remote.ssh_fallback`.
 
+### Fixed
+- Mouse-wheel, pane-frame, scrollbar, selection-scroll, and configured right-click passthrough interactions now focus the target pane through the server-owned runtime path; clicking a scrollbar track above its thumb no longer panics.
+
 ## [0.7.4] - 2026-07-15
 
 ### Added
