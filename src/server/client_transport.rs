@@ -500,9 +500,7 @@ pub(crate) fn client_message_to_event(
             }
         }
         ClientMessage::InputEvents { events } => match input_event_limit(&events) {
-            InputEventLimit::WithinLimits => {
-                ServerEvent::ClientInputEvents { client_id, events }
-            }
+            InputEventLimit::WithinLimits => ServerEvent::ClientInputEvents { client_id, events },
             InputEventLimit::TooManyEvents => {
                 return Err(ClientMessageCloseReason::InputEvents {
                     count: events.len(),
@@ -1638,7 +1636,7 @@ new_tab = "ctrl+notakey"
 
     #[test]
     fn shared_message_dispatch_applies_limits_and_transport_specials() {
-        let error = client_message_to_event(
+        let event = client_message_to_event(
             7,
             ClientMessage::InputEvents {
                 events: vec![ClientInputEvent::Paste {
@@ -1646,10 +1644,15 @@ new_tab = "ctrl+notakey"
                 }],
             },
         )
-        .expect_err("oversized paste must close every transport");
+        .expect("oversized paste is a soft rejection")
+        .expect("paste rejection event");
         assert!(matches!(
-            error,
-            ClientMessageCloseReason::InputEvents { count: 1 }
+            event,
+            ServerEvent::ClientPasteRejected {
+                client_id: 7,
+                size,
+                max: MAX_INPUT_PAYLOAD,
+            } if size == MAX_INPUT_PAYLOAD + 1
         ));
 
         let event = client_message_to_event(
