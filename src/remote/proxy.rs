@@ -15,11 +15,11 @@ use tracing::{debug, info, warn};
 
 use super::frame::lock;
 
-use super::quic::{ConnectParams, QuicSession, ResourceCache, SessionExit};
 use super::attach::{
     apply_managed_ssh_options, remote_bridge_command, remote_quic_candidates,
     request_remote_quic_bootstrap, ManagedSshOptions, RemoteHerdr,
 };
+use super::quic::{ConnectParams, QuicSession, ResourceCache, SessionExit};
 use crate::config::{RemoteConfig, RemoteTransportConfig};
 use crate::protocol::{
     ClientKeybindings, ClientLaunchMode, ClientMessage, RemoteBootstrapRecord,

@@ -11,6 +11,7 @@
 - `theme.custom.sidebar_bg` can now give the desktop sidebar its own background without changing built-in theme defaults.
 - Settings and `ui.status_indicators = "symbols"` can now use distinct static shapes for blocked, working, done, idle, and unknown agent states. (#2260)
 - The plugin marketplace now discovers valid manifests at repository roots and subdirectories, groups multiple plugins under each repository, and publishes their versions and exact default-branch commits.
+- `herdr --remote` now uses SSH-authenticated, certificate-pinned QUIC with bounded render/control queues, resumable path recovery, full-redraw and Kitty graphics reconstruction, automatic SSH rebootstrap, and transparent SSH stdio fallback. Configure the policy with `remote.transport`, `remote.quic_port_range`, `remote.quic_idle_timeout_seconds`, and `remote.ssh_fallback`.
 
 ### Changed
 - Desktop tab labels are now centered in their tabs, so the active-tab highlight has symmetric padding.
@@ -30,6 +31,7 @@
 - Claude Code confirmation prompts using `Enter to confirm · Esc to cancel` now report `blocked` instead of `idle`. (#2268)
 - Sidebar agent lists keep scrolling when differently sized clients are attached to the same session. (#2255, thanks @aiworkflowpro)
 - `pane send-keys` and `agent send-keys` now preserve Shift when sending `shift+tab`, allowing agent permission modes to be cycled programmatically. (#1561, thanks @keinstn and @tomohisa)
+- Mouse-wheel, pane-frame, scrollbar, selection-scroll, and configured right-click passthrough interactions now focus the target pane through the server-owned runtime path; clicking a scrollbar track above its thumb no longer panics.
 
 ## [0.8.0] - 2026-08-03
 
@@ -118,7 +120,6 @@
 - Installed and linked plugins, including their enabled state, are now global to the current user instead of isolated by Herdr session. Plugins installed only in a named session on Herdr 0.7.3 must be installed or linked again. (#1174)
 
 ### Added
-- `herdr --remote` now uses SSH-authenticated, certificate-pinned QUIC with bounded render/control queues, resumable path recovery, full-redraw and Kitty graphics reconstruction, automatic SSH rebootstrap, and transparent SSH stdio fallback. Configure the policy with `remote.transport`, `remote.quic_port_range`, `remote.quic_idle_timeout_seconds`, and `remote.ssh_fallback`.
 - Added a live-agent CLI facade with named `start`, atomic `prompt`, logical `send-keys`, and server-owned `wait` workflows. Agent startup targets an existing pane without changing topology, validates the requested interactive agent kind and strict agent name, and accepts native arguments after `--`.
 - Added transient declarative Agent view queries through `agent.view.set/clear`; filtered and sorted views now define sidebar, mobile, mouse, and agent-keybind navigation order.
 - Added one-shot plugin `[[startup]]` hooks for restoring plugin-owned state after server startup and live handoff.
@@ -159,7 +160,6 @@
 - Live handoff now preserves installed plugins and no longer lets the next plugin installation overwrite the existing registry. (#893)
 - `herdr agent wait` now returns `agent_not_running` promptly when its target pane closes instead of waiting for the full timeout. (#1439)
 - Pane graphics streams now shut down cleanly when a client disconnect races stream teardown.
-- Mouse-wheel, pane-frame, scrollbar, selection-scroll, and configured right-click passthrough interactions now focus the target pane through the server-owned runtime path; clicking a scrollbar track above its thumb no longer panics.
 
 ## [0.7.4] - 2026-07-15
 

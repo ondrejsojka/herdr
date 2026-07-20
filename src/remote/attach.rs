@@ -4,27 +4,35 @@ use super::shell_quote;
 use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::{self, IsTerminal, Write as _};
+#[cfg(unix)]
 use std::net::{SocketAddr, ToSocketAddrs};
+#[cfg(unix)]
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
-use interprocess::local_socket::traits::Listener as _;
 #[cfg(windows)]
-use interprocess::local_socket::traits::Stream as _;
+use interprocess::local_socket::traits::{Listener as _, Stream as _};
+#[cfg(windows)]
 use interprocess::local_socket::ListenerNonblockingMode;
+#[cfg(windows)]
 use interprocess::TryClone as _;
 use serde::Deserialize;
+#[cfg(windows)]
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
 };
-use std::thread::{self, JoinHandle};
+use std::thread;
+#[cfg(windows)]
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+#[cfg(windows)]
 const BRIDGE_ACCEPT_POLL: Duration = Duration::from_millis(50);
 #[cfg(windows)]
 const BRIDGE_IO_POLL: Duration = Duration::from_millis(1);
+#[cfg(windows)]
 const BRIDGE_SOCKET_PERMISSION_MODE: u32 = 0o600;
 const REMOTE_SERVER_SHUTDOWN_CONFIRM_TIMEOUT: Duration = Duration::from_secs(5);
 const REMOTE_SERVER_SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -187,70 +195,57 @@ pub(crate) fn run_remote(remote: RemoteLaunch) -> io::Result<()> {
         remote.live_handoff,
     )?;
 
-    let mut logical_client_id = [0u8; crate::protocol::REMOTE_QUIC_ID_BYTES];
-    getrandom::fill(&mut logical_client_id)
-        .map_err(|error| io::Error::other(format!("failed to create remote client id: {error}")))?;
-    let (ssh_hostname, bootstrap, bootstrap_error) =
-        if remote_config.transport == crate::config::RemoteTransportConfig::Ssh {
-            (None, None, None)
-        } else {
-            match remote_ssh.resolved_hostname() {
-                Ok(hostname) => match request_remote_quic_bootstrap(
-                    &remote.target,
-                    &prepared_remote.remote_herdr,
-                    &session_name,
-                    &logical_client_id,
-                    remote_ssh.options(),
-                ) {
-                    Ok(record) => (Some(hostname), Some(record), None),
-                    Err(error) => (Some(hostname), None, Some(error.to_string())),
-                },
-                Err(error) => (None, None, Some(error.to_string())),
-            }
-        };
-    let _bridge = super::proxy::ResumableRemoteBridge::start(super::proxy::BridgeConfig {
-        target: remote.target,
-        remote_herdr: prepared_remote.remote_herdr,
-        local_socket: local_socket.clone(),
+    #[cfg(unix)]
+    let _bridge = {
+        let mut logical_client_id = [0u8; crate::protocol::REMOTE_QUIC_ID_BYTES];
+        getrandom::fill(&mut logical_client_id).map_err(|error| {
+            io::Error::other(format!("failed to create remote client id: {error}"))
+        })?;
+        let (ssh_hostname, bootstrap, bootstrap_error) =
+            if remote_config.transport == crate::config::RemoteTransportConfig::Ssh {
+                (None, None, None)
+            } else {
+                match remote_ssh.resolved_hostname() {
+                    Ok(hostname) => match request_remote_quic_bootstrap(
+                        &remote.target,
+                        &prepared_remote.remote_herdr,
+                        &session_name,
+                        &logical_client_id,
+                        remote_ssh.options(),
+                    ) {
+                        Ok(record) => (Some(hostname), Some(record), None),
+                        Err(error) => (Some(hostname), None, Some(error.to_string())),
+                    },
+                    Err(error) => (None, None, Some(error.to_string())),
+                }
+            };
+        super::proxy::ResumableRemoteBridge::start(super::proxy::BridgeConfig {
+            target: remote.target,
+            remote_herdr: prepared_remote.remote_herdr,
+            local_socket: local_socket.clone(),
+            session_name,
+            ssh_options: remote_ssh.options().cloned(),
+            remote_config,
+            logical_client_id,
+            ssh_hostname,
+            bootstrap,
+            bootstrap_error,
+        })?
+    };
+
+    #[cfg(windows)]
+    let _bridge = SshStdioBridge::start(
+        remote.target,
+        prepared_remote.remote_herdr,
+        local_socket.clone(),
         session_name,
-        ssh_options: remote_ssh.options().cloned(),
-        remote_config,
-        logical_client_id,
-        ssh_hostname,
-        bootstrap,
-        bootstrap_error,
-    })?;
+        remote_ssh.options(),
+    )?;
 
     run_client_process(&local_socket, &reattach_command, remote.keybindings)
 }
 
-pub(crate) fn run_remote_client_bridge() -> io::Result<()> {
-    ensure_remote_server_running()?;
-
-    let socket_path = crate::server::socket_paths::client_socket_path();
-    let stream = UnixStream::connect(&socket_path).map_err(|err| {
-        io::Error::new(
-            err.kind(),
-            format!(
-                "failed to connect to remote Herdr client socket {}: {err}",
-                socket_path.display()
-            ),
-        )
-    })?;
-
-    let mut stdout = io::stdout().lock();
-    let mut socket_to_stdout = stream.try_clone()?;
-    let mut stdin_to_socket = stream;
-
-    let _upload = thread::spawn(move || {
-        let mut stdin = io::stdin();
-        let _ = copy_flush(&mut stdin, &mut stdin_to_socket);
-        let _ = stdin_to_socket.shutdown(std::net::Shutdown::Write);
-    });
-
-    copy_flush(&mut socket_to_stdout, &mut stdout).map(|_| ())
-}
-
+#[cfg(unix)]
 pub(crate) fn run_remote_quic_bootstrap(logical_client_id: Option<&str>) -> io::Result<()> {
     let logical_client_id = logical_client_id
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing logical client id"))
@@ -296,6 +291,7 @@ pub(crate) fn run_remote_quic_bootstrap(logical_client_id: Option<&str>) -> io::
     Ok(())
 }
 
+#[cfg(unix)]
 fn parse_logical_client_id(value: &str) -> io::Result<[u8; crate::protocol::REMOTE_QUIC_ID_BYTES]> {
     if value.len() != crate::protocol::REMOTE_QUIC_ID_BYTES * 2 {
         return Err(io::Error::new(
@@ -316,6 +312,7 @@ fn parse_logical_client_id(value: &str) -> io::Result<[u8; crate::protocol::REMO
     Ok(bytes)
 }
 
+#[cfg(unix)]
 fn format_logical_client_id(value: &[u8; crate::protocol::REMOTE_QUIC_ID_BYTES]) -> String {
     let mut encoded = String::with_capacity(crate::protocol::REMOTE_QUIC_ID_BYTES * 2);
     for byte in value {
@@ -325,6 +322,7 @@ fn format_logical_client_id(value: &[u8; crate::protocol::REMOTE_QUIC_ID_BYTES])
     encoded
 }
 
+#[cfg(unix)]
 fn ensure_remote_server_running() -> io::Result<()> {
     let socket_path = crate::server::socket_paths::client_socket_path();
     if crate::server::autodetect::is_server_listening() {
@@ -632,6 +630,7 @@ impl RemoteSsh {
         self.command().arg(command).output()
     }
 
+    #[cfg(unix)]
     fn resolved_hostname(&self) -> io::Result<String> {
         let output = self.base_command().arg("-G").arg(&self.target).output()?;
         if !output.status.success() {
@@ -1788,6 +1787,7 @@ pub(super) fn remote_bridge_command(remote_herdr: &RemoteHerdr, session_name: &s
     command
 }
 
+#[cfg(unix)]
 fn remote_quic_bootstrap_command(
     remote_herdr: &RemoteHerdr,
     session_name: &str,
@@ -1803,6 +1803,7 @@ fn remote_quic_bootstrap_command(
     command
 }
 
+#[cfg(unix)]
 pub(super) fn request_remote_quic_bootstrap(
     target: &str,
     remote_herdr: &RemoteHerdr,
@@ -1828,6 +1829,7 @@ pub(super) fn request_remote_quic_bootstrap(
         .map_err(|err| io::Error::other(format!("invalid remote QUIC bootstrap response: {err}")))
 }
 
+#[cfg(unix)]
 pub(super) fn remote_quic_candidates(hostname: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
     let mut candidates = (hostname, port).to_socket_addrs()?.collect::<Vec<_>>();
     candidates.sort_by_key(|candidate| if candidate.is_ipv6() { 0 } else { 1 });
@@ -1875,6 +1877,7 @@ fn command_failed(context: &str, output: &Output) -> io::Error {
     }
 }
 
+#[cfg(windows)]
 struct SshStdioBridge {
     local_socket: PathBuf,
     socket_identity: crate::ipc::SocketFileIdentity,
@@ -1882,6 +1885,7 @@ struct SshStdioBridge {
     thread: Option<JoinHandle<()>>,
 }
 
+#[cfg(windows)]
 impl SshStdioBridge {
     fn start(
         target: String,
@@ -1954,6 +1958,7 @@ impl SshStdioBridge {
     }
 }
 
+#[cfg(windows)]
 fn prepare_remote_bridge_stream(
     mut stream: crate::ipc::LocalStream,
 ) -> io::Result<crate::ipc::LocalStream> {
@@ -1961,6 +1966,7 @@ fn prepare_remote_bridge_stream(
     Ok(stream)
 }
 
+#[cfg(windows)]
 impl Drop for SshStdioBridge {
     fn drop(&mut self) {
         self.should_stop.store(true, Ordering::Release);
@@ -1973,7 +1979,6 @@ impl Drop for SshStdioBridge {
         let _ = crate::ipc::remove_socket_file_if_owned(&self.local_socket, &self.socket_identity);
     }
 }
-
 
 /// Quotes a path for an ssh_config `Include` so a path containing spaces (or
 /// glob metacharacters) is treated as one literal token instead of being split
@@ -2033,61 +2038,6 @@ fn write_managed_ssh_config() -> io::Result<ManagedSshConfig> {
             control_path,
         },
     })
-}
-
-#[cfg(unix)]
-fn bridge_connection(
-    stream: crate::ipc::LocalStream,
-    target: &str,
-    remote_herdr: &RemoteHerdr,
-    session_name: &str,
-    ssh_options: Option<&ManagedSshOptions>,
-    _bridge_stop: &Arc<AtomicBool>,
-) -> io::Result<()> {
-    let mut command = Command::new("ssh");
-    apply_managed_ssh_options(&mut command, ssh_options);
-    command
-        .arg("-T")
-        .arg(target)
-        .arg(remote_bridge_command(remote_herdr, session_name))
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit());
-
-    let mut child = command
-        .spawn()
-        .map_err(|err| io::Error::new(err.kind(), format!("failed to start ssh bridge: {err}")))?;
-    let mut child_stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "ssh bridge stdin missing"))?;
-    let mut child_stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "ssh bridge stdout missing"))?;
-    let mut stream_to_child = stream.try_clone()?;
-    let mut child_to_stream = stream;
-
-    let upload = thread::spawn(move || {
-        let _ = copy_flush(&mut stream_to_child, &mut child_stdin);
-    });
-    let download = thread::spawn(move || {
-        let _ = copy_flush(&mut child_stdout, &mut child_to_stream);
-        let _ = crate::ipc::shutdown_local_stream_write(&child_to_stream);
-    });
-
-    let status = child.wait()?;
-    let _ = upload.join();
-    let _ = download.join();
-
-    if status.success() {
-        Ok(())
-    } else {
-        Err(io::Error::new(
-            io::ErrorKind::ConnectionAborted,
-            format!("ssh bridge exited with {status}"),
-        ))
-    }
 }
 
 #[cfg(windows)]
@@ -2237,25 +2187,6 @@ fn bridge_connection(
             io::ErrorKind::ConnectionAborted,
             format!("ssh bridge exited with {status}"),
         ))
-    }
-}
-
-#[cfg(unix)]
-fn copy_flush<R: io::Read, W: io::Write>(reader: &mut R, writer: &mut W) -> io::Result<u64> {
-    let mut buffer = [0_u8; 16 * 1024];
-    let mut total = 0;
-
-    loop {
-        let bytes_read = match reader.read(&mut buffer) {
-            Ok(0) => return Ok(total),
-            Ok(bytes_read) => bytes_read,
-            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
-            Err(err) => return Err(err),
-        };
-
-        writer.write_all(&buffer[..bytes_read])?;
-        writer.flush()?;
-        total += bytes_read as u64;
     }
 }
 
@@ -2445,45 +2376,9 @@ mod tests {
         .expect("start bridge listener");
 
         let mode = std::fs::metadata(&socket).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, BRIDGE_SOCKET_PERMISSION_MODE);
+        assert_eq!(mode, 0o600);
 
         drop(bridge);
-        let _ = std::fs::remove_file(socket);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn accepted_bridge_stream_is_reset_to_blocking() {
-        use std::os::fd::AsRawFd as _;
-
-        fn is_nonblocking(stream: &crate::ipc::LocalStream) -> bool {
-            let fd = match stream {
-                crate::ipc::LocalStream::UdSocket(stream) => stream.inner().as_raw_fd(),
-            };
-            // SAFETY: F_GETFL only reads flags from the live descriptor owned by `stream`.
-            let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-            assert!(flags >= 0, "fcntl(F_GETFL): {}", io::Error::last_os_error());
-            flags & libc::O_NONBLOCK != 0
-        }
-
-        let socket = std::env::temp_dir().join(format!(
-            "herdr-bridge-blocking-test-{}.sock",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_file(&socket);
-        let listener = crate::ipc::bind_private_local_listener(&socket).expect("bind listener");
-        let client = crate::ipc::connect_local_stream(&socket).expect("connect client");
-        let mut server = listener.accept().expect("accept client");
-
-        crate::ipc::set_local_stream_polling(&mut server, true)
-            .expect("force the macOS accepted-stream state");
-        assert!(is_nonblocking(&server));
-        let server = prepare_remote_bridge_stream(server).expect("prepare bridge stream");
-        assert!(!is_nonblocking(&server));
-
-        drop(server);
-        drop(client);
-        drop(listener);
         let _ = std::fs::remove_file(socket);
     }
 
@@ -2560,10 +2455,7 @@ mod tests {
         }
 
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(
-            mode, BRIDGE_SOCKET_PERMISSION_MODE,
-            "keepalive config must be user-only"
-        );
+        assert_eq!(mode, 0o600, "keepalive config must be user-only");
         // The config lives in a private 0700 dir, not a predictable temp path.
         let dir = path.parent().expect("config has a parent dir");
         let dir_mode = std::fs::metadata(dir).unwrap().permissions().mode() & 0o777;

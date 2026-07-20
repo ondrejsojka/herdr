@@ -65,6 +65,8 @@ impl ClientWriter {
             },
             render: ClientRenderWriter {
                 target: ClientRenderTarget::Quic(render),
+                #[cfg(test)]
+                test_render: None,
             },
         }
     }
@@ -99,9 +101,12 @@ impl ClientWriter {
     ) -> Self {
         let queue = ClientWriterQueue::new();
         let drain = queue.clone();
+        let control_writer = ClientControlWriter::queue(queue.clone());
+        let mut render_writer = ClientRenderWriter::queue(queue);
+        render_writer.test_render = Some(render.clone());
         let writer = Self {
-            control: ClientControlWriter::queue(queue.clone()),
-            render: ClientRenderWriter::queue(queue),
+            control: control_writer,
+            render: render_writer,
         };
         std::thread::spawn(move || {
             while let Some(item) = drain.recv() {
@@ -134,6 +139,8 @@ enum ClientControlTarget {
 #[derive(Debug)]
 pub(crate) struct ClientRenderWriter {
     target: ClientRenderTarget,
+    #[cfg(test)]
+    test_render: Option<std::sync::mpsc::SyncSender<Vec<u8>>>,
 }
 
 #[derive(Debug)]
@@ -194,11 +201,15 @@ impl Clone for ClientRenderWriter {
                 queue.add_sender();
                 Self {
                     target: ClientRenderTarget::Queue(queue.clone()),
+                    #[cfg(test)]
+                    test_render: self.test_render.clone(),
                 }
             }
             #[cfg(unix)]
             ClientRenderTarget::Quic(sender) => Self {
                 target: ClientRenderTarget::Quic(sender.clone()),
+                #[cfg(test)]
+                test_render: self.test_render.clone(),
             },
         }
     }
@@ -219,10 +230,16 @@ impl ClientRenderWriter {
         queue.add_sender();
         Self {
             target: ClientRenderTarget::Queue(queue),
+            #[cfg(test)]
+            test_render: None,
         }
     }
 
     pub(crate) fn try_send(&self, data: Vec<u8>) -> Result<(), TrySendError<Vec<u8>>> {
+        #[cfg(test)]
+        if let Some(sender) = &self.test_render {
+            return sender.try_send(data);
+        }
         match &self.target {
             ClientRenderTarget::Queue(queue) => queue.try_send_render(data),
             #[cfg(unix)]
@@ -619,10 +636,8 @@ pub(crate) fn client_message_to_event(
             width_px,
             height_px,
         } => {
-            let geometry = crate::input::mouse::HostGeometry::new(
-                cols, rows, width_px, height_px,
-            )
-            .ok_or(ClientMessageCloseReason::PixelMouse)?;
+            let geometry = crate::input::mouse::HostGeometry::new(cols, rows, width_px, height_px)
+                .ok_or(ClientMessageCloseReason::PixelMouse)?;
             if data.len() > MAX_PIXEL_MOUSE_PAYLOAD
                 || crate::input::mouse::parse_report(&data).is_none()
             {
@@ -635,9 +650,7 @@ pub(crate) fn client_message_to_event(
             }
         }
         ClientMessage::InputEvents { events } => match input_event_limit(&events) {
-            InputEventLimit::WithinLimits => {
-                ServerEvent::ClientInputEvents { client_id, events }
-            }
+            InputEventLimit::WithinLimits => ServerEvent::ClientInputEvents { client_id, events },
             InputEventLimit::TooManyEvents => {
                 return Err(ClientMessageCloseReason::InputEvents {
                     count: events.len(),
@@ -1964,7 +1977,7 @@ new_tab = "ctrl+notakey"
 
     #[test]
     fn shared_message_dispatch_applies_limits_and_transport_specials() {
-        let error = client_message_to_event(
+        let event = client_message_to_event(
             7,
             ClientMessage::InputEvents {
                 events: vec![ClientInputEvent::Paste {
@@ -1972,10 +1985,15 @@ new_tab = "ctrl+notakey"
                 }],
             },
         )
-        .expect_err("oversized paste must close every transport");
+        .expect("oversized paste is a soft rejection")
+        .expect("paste rejection event");
         assert!(matches!(
-            error,
-            ClientMessageCloseReason::InputEvents { count: 1 }
+            event,
+            ServerEvent::ClientPasteRejected {
+                client_id: 7,
+                size,
+                max: MAX_INPUT_PAYLOAD,
+            } if size == MAX_INPUT_PAYLOAD + 1
         ));
 
         let event = client_message_to_event(

@@ -9,9 +9,9 @@ pub(crate) mod frame;
 mod quic;
 
 #[cfg(unix)]
-mod proxy;
-#[cfg(unix)]
 mod host_unix;
+#[cfg(unix)]
+mod proxy;
 
 pub(crate) use attach::*;
 #[cfg(unix)]
