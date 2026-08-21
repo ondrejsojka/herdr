@@ -937,7 +937,7 @@ impl App {
             command.current_dir(cwd);
         }
         let child = command.spawn()?;
-        self.detached_custom_command_children.push(child);
+        self.detached_process_children.push(child);
         Ok(())
     }
 
@@ -975,7 +975,8 @@ impl App {
             .state
             .runtime_for_pane_in_workspace(&self.terminal_runtimes, ws_idx, pane_id)
             .ok_or_else(|| std::io::Error::other("focused pane has no scrollback runtime"))?
-            .recent_text(usize::MAX);
+            .recent_unwrapped_text_snapshot(usize::MAX)
+            .text;
 
         let path = write_scrollback_temp_file(&scrollback)?;
 
@@ -2014,9 +2015,9 @@ mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, ModifierKeyCode};
     use ratatui::layout::Direction;
 
-    #[cfg(unix)]
-    use super::super::wait_for_file;
     use super::super::{state_with_workspaces, unique_temp_path};
+    #[cfg(unix)]
+    use super::super::{wait_for_detached_process_reap, wait_for_file};
     use super::*;
     use crate::{
         app::App,
@@ -2816,6 +2817,39 @@ resize_pane_left = "prefix+shift+left"
     }
 
     #[test]
+    fn shifted_backslash_layout_prefers_horizontal_split_binding() {
+        let config: Config = toml::from_str(
+            r#"
+[keys]
+split_vertical = "prefix+|"
+split_horizontal = 'prefix+\'
+"#,
+        )
+        .unwrap();
+        let mut state = state_with_workspaces(&["test"]);
+        state.keybinds = config.keybinds();
+        let key = crate::input::parse_terminal_key_sequence("\x1b[124:92;2:1u").unwrap();
+        assert_eq!(key.code, KeyCode::Char('|'));
+        assert_eq!(key.modifiers, KeyModifiers::SHIFT);
+        assert_eq!(key.shifted_codepoint, Some('\\' as u32));
+        assert!(state.keybinds.split_horizontal.matches_prefix_key(&key));
+        assert!(!state.keybinds.split_vertical.matches_prefix_key(&key));
+
+        assert_eq!(
+            action_for_key(&state, key, BindingDispatch::Prefix),
+            Some(NavigateAction::SplitHorizontal)
+        );
+        assert_eq!(
+            action_for_key(
+                &state,
+                TerminalKey::new(KeyCode::Char('|'), KeyModifiers::empty()),
+                BindingDispatch::Prefix,
+            ),
+            Some(NavigateAction::SplitVertical)
+        );
+    }
+
+    #[test]
     fn prefix_tab_override_can_map_to_last_pane() {
         let config: Config = toml::from_str(
             r#"
@@ -3509,16 +3543,10 @@ navigate_pane_down = "ctrl+j"
         assert_eq!(app.state.mode, Mode::Terminal);
 
         std::fs::write(&release_path, b"release").expect("release command");
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
-        while crate::platform::process_exists(pid) && tokio::time::Instant::now() < deadline {
-            app.reap_finished_custom_commands();
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        app.reap_finished_custom_commands();
-        let reaped_by_runtime = !crate::platform::process_exists(pid);
+        let reaped_by_runtime = wait_for_detached_process_reap(&mut app, pid).await;
         if !reaped_by_runtime {
             if let Some(child) = app
-                .detached_custom_command_children
+                .detached_process_children
                 .iter_mut()
                 .find(|child| child.id() == pid)
             {
@@ -3628,7 +3656,7 @@ navigate_pane_down = "ctrl+j"
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn edit_scrollback_key_opens_focused_runtime_scrollback_in_editor_pane() {
+    async fn edit_scrollback_key_preserves_logical_lines_in_editor_pane() {
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = App::new(
             &Config::default(),
@@ -3642,10 +3670,10 @@ navigate_pane_down = "ctrl+j"
         workspace.tabs[0].runtimes.insert(
             root_pane,
             crate::terminal::TerminalRuntime::test_with_scrollback_bytes(
-                20,
+                5,
                 5,
                 4096,
-                b"alpha\nbeta\n",
+                b"ABCDEFGHIJ\r\nKLMNO",
             ),
         );
         app.state.workspaces = vec![workspace];
@@ -3675,8 +3703,7 @@ navigate_pane_down = "ctrl+j"
         }
 
         let content = wait_for_file(&output_path);
-        assert!(content.contains("alpha"));
-        assert!(content.contains("beta"));
+        assert_eq!(content, "ABCDEFGHIJ\nKLMNO");
         assert_eq!(app.state.mode, Mode::Terminal);
         assert!(
             app.state.terminals.values().any(|terminal| terminal

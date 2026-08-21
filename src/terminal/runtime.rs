@@ -313,11 +313,31 @@ impl TerminalRuntime {
 
     /// Collects the complete terminal input-mode snapshot.
     ///
-    /// This performs multiple terminal queries and may format keyboard state.
-    /// Keep it out of render/layout and pane-scaled loops; add a narrow accessor
-    /// when only one terminal fact is needed.
+    /// This performs multiple terminal queries. Keep it out of render/layout
+    /// and pane-scaled loops; add a narrow accessor when one fact is needed.
+    #[cfg(test)]
     pub fn input_state(&self) -> Option<crate::pane::InputState> {
         self.0.input_state()
+    }
+
+    pub fn keyboard_report_all_requested(&self) -> bool {
+        self.0.keyboard_report_all_requested()
+    }
+
+    pub fn bracketed_paste_enabled(&self) -> bool {
+        self.0.bracketed_paste_enabled()
+    }
+
+    pub fn mouse_reporting_enabled(&self) -> bool {
+        self.0.mouse_reporting_enabled()
+    }
+
+    pub fn sgr_pixel_mouse_enabled(&self) -> bool {
+        self.0.sgr_pixel_mouse_enabled()
+    }
+
+    pub fn plain_page_keys_use_host_scrollback(&self) -> Option<bool> {
+        self.0.plain_page_keys_use_host_scrollback()
     }
 
     /// Reads only whether the alternate screen is active.
@@ -359,10 +379,6 @@ impl TerminalRuntime {
 
     pub fn agent_osc_progress(&self) -> String {
         self.0.agent_osc_progress()
-    }
-
-    pub fn recent_text(&self, lines: usize) -> String {
-        self.0.recent_text(lines)
     }
 
     pub(crate) fn recent_text_snapshot(&self, lines: usize) -> crate::pane::TerminalReadSnapshot {
@@ -472,6 +488,27 @@ impl TerminalRuntime {
         Some((screen, crate::terminal::ScreenSnapshot { cols, rows }))
     }
 
+    pub(crate) fn screen_text_snapshot_with_seq(
+        &self,
+    ) -> Option<(
+        crate::ghostty::ActiveScreen,
+        crate::terminal::ScreenSnapshot,
+        u64,
+    )> {
+        for _ in 0..3 {
+            let before = self.content_seq();
+            if !before.is_multiple_of(2) {
+                continue;
+            }
+            let (screen, snapshot) = self.screen_text_snapshot()?;
+            let after = self.content_seq();
+            if before == after {
+                return Some((screen, snapshot, after));
+            }
+        }
+        None
+    }
+
     pub fn encode_mouse_button(
         &self,
         kind: crossterm::event::MouseEventKind,
@@ -528,6 +565,10 @@ impl TerminalRuntime {
 
     pub(crate) fn current_size(&self) -> (u16, u16) {
         self.0.current_size()
+    }
+
+    pub(crate) fn content_seq(&self) -> u64 {
+        self.0.content_seq()
     }
 }
 
