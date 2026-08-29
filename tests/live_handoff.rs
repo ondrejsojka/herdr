@@ -1229,7 +1229,7 @@ fn live_handoff_keeps_unmanaged_agent_name_bound_to_saved_session() {
     fs::write(
         &fake_pi,
         format!(
-            "#!/bin/sh\nexport HERDR_AGENT=pi\necho started > {}\nexec /bin/sleep 30\n",
+            "#!/bin/sh\nexport HERDR_AGENT=pi\necho started > {}\n/bin/sleep 30\n",
             started_marker.display()
         ),
     )
@@ -1416,19 +1416,27 @@ fn live_handoff_keeps_agent_started_pane_after_agent_exits() {
         .unwrap()
         .to_string();
 
-    let started = request(
-        &api_socket,
-        serde_json::json!({
-            "id": "test:agent-start",
-            "method": "agent.start",
-            "params": {
-                "name": "handoff-agent",
-                "kind": "pi",
-                "pane_id": pane_id,
-                "timeout_ms": 5000
-            }
-        }),
-    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut started = serde_json::Value::Null;
+    while Instant::now() < deadline {
+        started = request(
+            &api_socket,
+            serde_json::json!({
+                "id": "test:agent-start",
+                "method": "agent.start",
+                "params": {
+                    "name": "handoff-agent",
+                    "kind": "pi",
+                    "pane_id": pane_id,
+                    "timeout_ms": 5000
+                }
+            }),
+        );
+        if started.get("result").is_some() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
     assert_ok(started);
     support::wait_for_file(&started_marker, Duration::from_secs(5));
 

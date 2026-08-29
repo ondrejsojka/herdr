@@ -304,7 +304,7 @@ fn ping_over_socket_returns_version() {
     assert_eq!(value["result"]["version"], env!("CARGO_PKG_VERSION"));
     // Intentionally hardcoded so wire protocol bumps require updating this test.
     // Changing this value means old clients/servers are no longer compatible.
-    assert_eq!(value["result"]["protocol"], 20);
+    assert_eq!(value["result"]["protocol"], 21);
 
     cleanup_spawned_herdr(child, base);
 }
@@ -1494,6 +1494,12 @@ fn events_subscribe_streams_pane_split_and_close_events() {
     let ack = reader.read_json_line(Duration::from_secs(2));
     assert_eq!(ack["id"], "sub_life_b");
     assert_eq!(ack["result"]["type"], "subscription_started");
+    assert!(
+        reader
+            .try_read_json_line(Duration::from_millis(250))
+            .is_none(),
+        "new subscription must not replay the root pane creation"
+    );
 
     let split = send_request(
         &socket_path,

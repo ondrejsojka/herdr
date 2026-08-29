@@ -567,6 +567,24 @@ impl App {
         source_id: super::InputSourceId,
         mouse: MouseEvent,
     ) -> bool {
+        let event_tx = self.event_tx.clone();
+        self.handle_modified_url_click_with(source_id, mouse, move |url| {
+            // Client-local side effect (like ClipboardWrite): emit an event so headless
+            // servers forward OpenUrl to the foreground thin client instead of opening
+            // a browser on the remote host.
+            let _ = event_tx.try_send(crate::events::AppEvent::OpenUrl {
+                url: url.to_owned(),
+            });
+            Ok(None)
+        })
+    }
+
+    fn handle_modified_url_click_with(
+        &mut self,
+        source_id: super::InputSourceId,
+        mouse: MouseEvent,
+        open_url: impl FnOnce(&str) -> std::io::Result<Option<std::process::Child>>,
+    ) -> bool {
         if self.state.mode != Mode::Terminal
             || !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
             || !mouse.modifiers.contains(modified_url_click_modifier())
@@ -586,21 +604,29 @@ impl App {
             return false;
         };
 
-        self.last_pane_click = None;
-        self.pending_url_click_sources.insert(source_id);
-        match self.invoke_plugin_link_handler_for_url(&url, info.id) {
-            Ok(true) => return true,
-            Ok(false) => {}
+        let plugin_handled = match self.invoke_plugin_link_handler_for_url(&url, info.id) {
+            Ok(handled) => handled,
             Err(err) => {
                 tracing::warn!(err = %err, url = %url, "failed to invoke plugin link handler");
+                false
+            }
+        };
+        if !plugin_handled && crate::app::actions::safe_web_url(&url).is_none() {
+            return false;
+        }
+
+        self.last_pane_click = None;
+        self.pending_url_click_sources.insert(source_id);
+        if plugin_handled {
+            return true;
+        }
+        match open_url(&url) {
+            Ok(Some(child)) => self.detached_process_children.push(child),
+            Ok(None) => {}
+            Err(err) => {
+                tracing::warn!(err = %err, url = %url, "failed to open pane URL");
             }
         }
-        // Client-local side effect (like ClipboardWrite): emit an event so headless
-        // servers forward OpenUrl to the foreground thin client instead of opening
-        // a browser on the remote host.
-        let _ = self
-            .event_tx
-            .try_send(crate::events::AppEvent::OpenUrl { url });
         true
     }
 

@@ -645,6 +645,68 @@ impl Palette {
         }
         self
     }
+
+    pub fn with_mode_overrides(mut self, custom: &crate::config::ModeThemeColors) -> Self {
+        use crate::config::parse_color;
+        if let Some(c) = &custom.accent {
+            self.accent = parse_color(c);
+        }
+        if let Some(c) = &custom.panel_bg {
+            self.panel_bg = parse_color(c);
+        }
+        if let Some(c) = &custom.sidebar_bg {
+            self.sidebar_bg = parse_color(c);
+        }
+        if let Some(c) = &custom.active_row_bg {
+            self.active_row_bg = parse_color(c);
+        }
+        if let Some(c) = &custom.selection_bg {
+            self.selection_bg = parse_color(c);
+        }
+        if let Some(c) = &custom.surface0 {
+            self.surface0 = parse_color(c);
+        }
+        if let Some(c) = &custom.surface1 {
+            self.surface1 = parse_color(c);
+        }
+        if let Some(c) = &custom.surface_dim {
+            self.surface_dim = parse_color(c);
+        }
+        if let Some(c) = &custom.overlay0 {
+            self.overlay0 = parse_color(c);
+        }
+        if let Some(c) = &custom.overlay1 {
+            self.overlay1 = parse_color(c);
+        }
+        if let Some(c) = &custom.text {
+            self.text = parse_color(c);
+        }
+        if let Some(c) = &custom.subtext0 {
+            self.subtext0 = parse_color(c);
+        }
+        if let Some(c) = &custom.mauve {
+            self.mauve = parse_color(c);
+        }
+        if let Some(c) = &custom.green {
+            self.green = parse_color(c);
+        }
+        if let Some(c) = &custom.yellow {
+            self.yellow = parse_color(c);
+        }
+        if let Some(c) = &custom.red {
+            self.red = parse_color(c);
+        }
+        if let Some(c) = &custom.blue {
+            self.blue = parse_color(c);
+        }
+        if let Some(c) = &custom.teal {
+            self.teal = parse_color(c);
+        }
+        if let Some(c) = &custom.peach {
+            self.peach = parse_color(c);
+        }
+        self
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1383,6 +1445,8 @@ pub struct AppState {
     pub(crate) previous_pane_focus: Option<PaneFocusTarget>,
     pub selected: usize,
     pub mode: Mode,
+    /// Stable workspace identity captured when the close confirmation opens.
+    pub(crate) confirm_close_workspace_id: Option<String>,
     pub should_quit: bool,
     /// In monolithic --no-session mode, detach exits the app because there is no server to detach from.
     pub detach_exits: bool,
@@ -1774,6 +1838,7 @@ impl AppState {
             previous_pane_focus: None,
             selected: 0,
             mode: Mode::Navigate,
+            confirm_close_workspace_id: None,
             should_quit: false,
             detach_exits: false,
             detach_requested: false,

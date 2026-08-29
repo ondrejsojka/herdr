@@ -80,27 +80,14 @@ impl App {
             return;
         }
 
-        if let Some(action) =
-            non_indexed_action_for_key(&self.state, &raw_key, BindingDispatch::Prefix)
-        {
-            self.execute_prefix_key_action(action);
-            return;
+        match prefix_binding_for_key(&self.state, &raw_key) {
+            Some(PrefixBindingMatch::Action(action)) => self.execute_prefix_key_action(action),
+            Some(PrefixBindingMatch::Command(binding)) => {
+                self.cancel_copy_mode_if_active();
+                self.launch_custom_command(binding, ActionContext::Prefix);
+            }
+            None => leave_command_mode(&mut self.state),
         }
-
-        if let Some(binding) = command_for_key(&self.state, &raw_key, BindingDispatch::Prefix) {
-            self.cancel_copy_mode_if_active();
-            self.launch_custom_command(binding, ActionContext::Prefix);
-            return;
-        }
-
-        if let Some(action) =
-            indexed_navigation_action(&self.state, &raw_key, BindingDispatch::Prefix)
-        {
-            self.execute_prefix_key_action(action);
-            return;
-        }
-
-        leave_command_mode(&mut self.state);
     }
 
     fn execute_prefix_key_action(&mut self, action: NavigateAction) {
@@ -227,7 +214,7 @@ impl App {
                     if self.state.confirm_close {
                         super::modal::open_confirm_close(&mut self.state);
                     } else {
-                        self.close_workspace_idx_via_api(ws_idx);
+                        self.close_workspace_idx_with_group_via_api(ws_idx);
                         leave_navigate_mode(&mut self.state);
                     }
                 }
@@ -456,9 +443,9 @@ impl App {
         self.runtime_workspace_focus("tui.workspace.focus", workspace_id);
     }
 
-    pub(crate) fn close_workspace_idx_via_api(&mut self, ws_idx: usize) {
+    pub(crate) fn close_workspace_idx_with_group_via_api(&mut self, ws_idx: usize) {
         let workspace_id = self.public_workspace_id(ws_idx);
-        self.runtime_workspace_close("tui.workspace.close", workspace_id);
+        self.runtime_workspace_close_group("tui.workspace.close", workspace_id);
     }
 
     pub(crate) fn move_workspace_via_api(&mut self, source_ws_idx: usize, insert_idx: usize) {
@@ -502,7 +489,7 @@ impl App {
             if self.state.confirm_implicit_worktree_group_close(ws_idx) {
                 return true;
             }
-            self.close_workspace_idx_via_api(ws_idx);
+            self.close_workspace_idx_with_group_via_api(ws_idx);
             return false;
         }
         let tab_idx = self.state.workspaces[ws_idx].active_tab_index();
@@ -1183,6 +1170,43 @@ impl App {
 pub(crate) enum BindingDispatch {
     Direct,
     Prefix,
+}
+
+enum PrefixBindingMatch {
+    Action(NavigateAction),
+    Command(crate::config::CustomCommandKeybind),
+}
+
+fn prefix_binding_for_key(state: &AppState, key: &TerminalKey) -> Option<PrefixBindingMatch> {
+    exact_prefix_binding_for_key(state, key).or_else(|| {
+        generated_character_key(key)
+            .as_ref()
+            .and_then(|generated_key| exact_prefix_binding_for_key(state, generated_key))
+    })
+}
+
+fn exact_prefix_binding_for_key(state: &AppState, key: &TerminalKey) -> Option<PrefixBindingMatch> {
+    non_indexed_action_for_key(state, key, BindingDispatch::Prefix)
+        .map(PrefixBindingMatch::Action)
+        .or_else(|| {
+            command_for_key(state, key, BindingDispatch::Prefix).map(PrefixBindingMatch::Command)
+        })
+        .or_else(|| {
+            indexed_navigation_action(state, key, BindingDispatch::Prefix)
+                .map(PrefixBindingMatch::Action)
+        })
+}
+
+fn generated_character_key(key: &TerminalKey) -> Option<TerminalKey> {
+    let mut characters = key.generated_text.as_deref()?.chars();
+    let character = characters.next()?;
+    if character.is_control() || characters.next().is_some() {
+        return None;
+    }
+    Some(TerminalKey::new(
+        KeyCode::Char(character),
+        crossterm::event::KeyModifiers::empty(),
+    ))
 }
 
 pub(crate) fn command_for_key(
@@ -2817,6 +2841,62 @@ resize_pane_left = "prefix+shift+left"
     }
 
     #[test]
+    fn generated_character_prefix_binding_falls_back_after_exact_chord() {
+        let generated_key = crate::input::parse_terminal_key_sequence("\x1b[119;3;124u").unwrap();
+        assert_eq!(generated_key.code, KeyCode::Char('w'));
+        assert_eq!(generated_key.modifiers, KeyModifiers::ALT);
+        assert_eq!(generated_key.generated_text.as_deref(), Some("|"));
+
+        let generated_only: Config = toml::from_str(
+            r#"
+[keys]
+split_vertical = "prefix+|"
+"#,
+        )
+        .unwrap();
+        let mut state = state_with_workspaces(&["test"]);
+        state.keybinds = generated_only.keybinds();
+        assert!(matches!(
+            prefix_binding_for_key(&state, &generated_key),
+            Some(PrefixBindingMatch::Action(NavigateAction::SplitVertical))
+        ));
+        let multi_character_key =
+            crate::input::parse_terminal_key_sequence("\x1b[119;3;124:120u").unwrap();
+        assert!(prefix_binding_for_key(&state, &multi_character_key).is_none());
+
+        let exact_and_generated: Config = toml::from_str(
+            r#"
+[keys]
+split_vertical = "prefix+|"
+split_horizontal = "prefix+alt+w"
+"#,
+        )
+        .unwrap();
+        state.keybinds = exact_and_generated.keybinds();
+        assert!(matches!(
+            prefix_binding_for_key(&state, &generated_key),
+            Some(PrefixBindingMatch::Action(NavigateAction::SplitHorizontal))
+        ));
+
+        let exact_command: Config = toml::from_str(
+            r#"
+[keys]
+split_vertical = "prefix+|"
+
+[[keys.command]]
+key = "prefix+alt+w"
+command = "echo exact"
+"#,
+        )
+        .unwrap();
+        state.keybinds = exact_command.keybinds();
+        assert!(matches!(
+            prefix_binding_for_key(&state, &generated_key),
+            Some(PrefixBindingMatch::Command(binding)) if binding.command == "echo exact"
+        ));
+    }
+
+    #[test]
     fn shifted_backslash_layout_prefers_horizontal_split_binding() {
         let config: Config = toml::from_str(
             r#"
@@ -3435,6 +3515,23 @@ navigate_pane_down = "ctrl+j"
         assert_eq!(state.workspaces.len(), 1);
         assert_eq!(state.workspaces[0].display_name(), "main");
         assert_eq!(state.mode, Mode::Terminal);
+    }
+
+    #[test]
+    fn tui_close_parent_group_closes_immediately_when_confirmation_disabled() {
+        let mut app = app_with_test_workspaces(&["main", "issue"]);
+        mark_worktree_space_member(&mut app.state, 0, "repo-key");
+        mark_worktree_space_member(&mut app.state, 1, "repo-key");
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Navigate;
+        app.state.confirm_close = false;
+
+        app.execute_tui_navigate_action(NavigateAction::CloseWorkspace, ActionContext::Navigate);
+
+        assert!(app.state.workspaces.is_empty());
+        assert_eq!(app.state.mode, Mode::Navigate);
+        assert_eq!(app.event_hub.events_after(0).len(), 2);
     }
 
     #[test]
