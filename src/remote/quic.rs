@@ -163,57 +163,95 @@ impl DeferredState {
     }
 }
 
-/// Owns both probe deadlines, which are not the same quantity:
-///
-/// - *when to send* the next probe on a path that looks healthy;
-/// - *when to judge* a probe that has already gone unanswered.
-///
-/// Driving both from one periodic timer is what made a heartbeat-originated
-/// probe wait a full `HEARTBEAT_INTERVAL` for its verdict while an
-/// input-originated one was judged in `FAST_PROBE_INTERVAL`. Sending and
-/// scheduling are now one operation, so every probe is judged on the same
-/// deadline regardless of what prompted it.
-#[derive(Debug)]
-struct ProbeScheduler {
-    /// When the last probe was sent. Drives *scheduling* only.
-    last_probe_at: Instant,
-    /// Send time of the oldest probe no pong has retired yet. Drives
-    /// *silence* only. Deliberately a different clock: scheduling from this
-    /// one would leave the deadline permanently in the past during an outage
-    /// and spin the loop.
-    oldest_unacked_at: Option<Instant>,
+/// Outcome of filtering input against current path liveness.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum FilteredInput {
+    /// Deliver this input message over the live transport.
+    Deliver(ClientMessage),
+    /// Absorbed: dropped as ephemeral, or deferred for replay on recovery.
+    Absorbed,
+    /// User requested detach while dark; notify best-effort and exit.
+    Detach(ClientMessage),
 }
 
-impl ProbeScheduler {
+/// Outcome of receiving a pong from the remote peer.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum PongOutcome {
+    /// Path was healthy; no recovery action required.
+    Healthy,
+    /// Path had been corroborated dead; replayed messages must be sent
+    /// before the recovery SyncRequest.
+    Recovered { replay: Vec<ClientMessage> },
+}
+
+/// Outcome of a scheduled timer tick for path liveness evaluation.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum TickOutcome {
+    /// Continuous silence exceeded PATH_LOST_AFTER; the connection should be abandoned.
+    Lost { silence: Duration },
+    /// Scheduled probe to send, along with any threshold notifications.
+    Probe {
+        message: ClientMessage,
+        announce_recovering: bool,
+        needs_rebind: bool,
+    },
+}
+
+/// Owns path liveness monitoring, probe scheduling, silence tracking,
+/// outage state progression, and input deferral during outages.
+///
+/// Owns both probe deadlines (when to send the next probe on a healthy path,
+/// and when to judge a probe that has gone unanswered), silence-driven
+/// thresholds (announcing path recovery, corroborating staleness, socket rebind,
+/// and connection abandonment), and the deferred input state withheld while dark.
+#[derive(Debug)]
+pub(crate) struct PathMonitor {
+    /// When the last probe was sent. Drives scheduling only.
+    last_probe_at: Instant,
+    /// Send time of the oldest probe no pong has retired yet. Drives silence only.
+    oldest_unacked_at: Option<Instant>,
+    /// Instant when silence first exceeded PATH_STALE_AFTER.
+    stale_since: Option<Instant>,
+    /// Set once silence exceeds STALE_CORROBORATED_AFTER; gates input dropping
+    /// and recovery replay on return.
+    stale_corroborated: bool,
+    /// Instant when endpoint rebind was triggered after REBIND_AFTER.
+    rebound_at: Option<Instant>,
+    /// Nonce sequence for probe messages.
+    next_nonce: u64,
+    /// Connection state withheld while the path is corroborated dead.
+    deferred: DeferredState,
+}
+
+impl PathMonitor {
     /// The first probe is due immediately: liveness has to be measured from
-    /// connect, not from one `HEARTBEAT_INTERVAL` later.
-    fn new(now: Instant) -> Self {
+    /// connect, not from one HEARTBEAT_INTERVAL later.
+    pub(crate) fn new(now: Instant) -> Self {
         Self {
             last_probe_at: now.checked_sub(HEARTBEAT_INTERVAL).unwrap_or(now),
             oldest_unacked_at: None,
+            stale_since: None,
+            stale_corroborated: false,
+            rebound_at: None,
+            next_nonce: 1,
+            deferred: DeferredState::default(),
         }
     }
 
-    fn probe_outstanding(&self) -> bool {
+    pub(crate) fn probe_outstanding(&self) -> bool {
         self.oldest_unacked_at.is_some()
     }
 
     /// How long the peer has been silent, measured from the oldest probe it
     /// has not answered. `None` when nothing is outstanding.
-    fn silence(&self, now: Instant) -> Option<Duration> {
+    pub(crate) fn silence(&self, now: Instant) -> Option<Duration> {
         self.oldest_unacked_at
-            .map(|sent_at| now.duration_since(sent_at))
+            .and_then(|sent_at| now.checked_duration_since(sent_at))
     }
 
-    fn on_probe_sent(&mut self, now: Instant) {
-        self.last_probe_at = now;
-        // Keep the oldest: it, not the newest, measures the silence.
-        self.oldest_unacked_at.get_or_insert(now);
-    }
-
-    /// Any pong proves liveness now, so it retires every outstanding probe.
-    fn on_pong(&mut self) {
-        self.oldest_unacked_at = None;
+    #[cfg(test)]
+    pub(crate) fn is_stale_corroborated(&self) -> bool {
+        self.stale_corroborated
     }
 
     /// Next instant the loop must wake to send and judge.
@@ -221,9 +259,9 @@ impl ProbeScheduler {
     /// One deadline covers both because sending advances `last_probe_at`: an
     /// unanswered probe is re-evaluated a judge interval after the last send,
     /// and a healthy path is simply probed again a heartbeat later.
-    fn wake_at(&self, stale_since: Option<Instant>, now: Instant) -> Instant {
+    pub(crate) fn wake_at(&self, now: Instant) -> Instant {
         let interval = if self.probe_outstanding() {
-            self.judge_interval(stale_since, now)
+            self.judge_interval(now)
         } else {
             HEARTBEAT_INTERVAL
         };
@@ -232,10 +270,97 @@ impl ProbeScheduler {
 
     /// Long outages back off so a dead radio is not held awake, but only past
     /// the window in which the path plausibly returns soon.
-    fn judge_interval(&self, stale_since: Option<Instant>, now: Instant) -> Duration {
-        match stale_since {
-            Some(since) if now.duration_since(since) >= FAST_PROBE_WINDOW => SLOW_PROBE_INTERVAL,
+    fn judge_interval(&self, now: Instant) -> Duration {
+        match self.stale_since {
+            Some(since)
+                if now
+                    .checked_duration_since(since)
+                    .is_some_and(|d| d >= FAST_PROBE_WINDOW) =>
+            {
+                SLOW_PROBE_INTERVAL
+            }
             _ => FAST_PROBE_INTERVAL,
+        }
+    }
+
+    pub(crate) fn on_probe_sent(&mut self, now: Instant) {
+        self.last_probe_at = now;
+        // Keep the oldest: it, not the newest, measures the silence.
+        self.oldest_unacked_at.get_or_insert(now);
+    }
+
+    /// Typing starts the liveness clock if no probe is currently outstanding.
+    pub(crate) fn maybe_input_probe(&mut self, now: Instant) -> Option<ClientMessage> {
+        if self.probe_outstanding() {
+            None
+        } else {
+            let nonce = self.next_nonce;
+            self.next_nonce = self.next_nonce.saturating_add(1);
+            self.on_probe_sent(now);
+            Some(ClientMessage::RemotePing { nonce })
+        }
+    }
+
+    /// Filters client input against path liveness: ephemeral input is dropped
+    /// while corroborated dead, geometry/mode changes are deferred, and detach
+    /// passes through for best-effort delivery.
+    pub(crate) fn filter_input(&mut self, input: ClientMessage) -> FilteredInput {
+        if self.stale_corroborated {
+            match self.deferred.hold(input) {
+                None => FilteredInput::Absorbed,
+                Some(detach) => FilteredInput::Detach(detach),
+            }
+        } else {
+            FilteredInput::Deliver(input)
+        }
+    }
+
+    /// Any pong proves liveness now, so it retires every outstanding probe.
+    /// If the path was corroborated dead, replayed messages are returned
+    /// to be sent before the recovery SyncRequest.
+    pub(crate) fn on_pong(&mut self) -> PongOutcome {
+        self.oldest_unacked_at = None;
+        self.stale_since = None;
+        self.rebound_at = None;
+        if std::mem::take(&mut self.stale_corroborated) {
+            PongOutcome::Recovered {
+                replay: self.deferred.replay().collect(),
+            }
+        } else {
+            PongOutcome::Healthy
+        }
+    }
+
+    /// Evaluates silence thresholds and produces the next scheduled probe.
+    pub(crate) fn on_tick(&mut self, now: Instant) -> TickOutcome {
+        let silence = self.silence(now);
+        let mut announce_recovering = false;
+        let mut needs_rebind = false;
+
+        if let Some(silence) = silence {
+            if silence >= PATH_LOST_AFTER {
+                return TickOutcome::Lost { silence };
+            }
+            if silence >= PATH_STALE_AFTER && self.stale_since.is_none() {
+                self.stale_since = Some(now);
+                announce_recovering = true;
+            }
+            if silence >= STALE_CORROBORATED_AFTER {
+                self.stale_corroborated = true;
+            }
+            if silence >= REBIND_AFTER && self.rebound_at.is_none() {
+                self.rebound_at = Some(now);
+                needs_rebind = true;
+            }
+        }
+
+        let nonce = self.next_nonce;
+        self.next_nonce = self.next_nonce.saturating_add(1);
+        self.on_probe_sent(now);
+        TickOutcome::Probe {
+            message: ClientMessage::RemotePing { nonce },
+            announce_recovering,
+            needs_rebind,
         }
     }
 }
@@ -487,29 +612,18 @@ impl QuicSession {
         // Only pongs retire probes. Inbound render frames must not, or an
         // asymmetric failure — server->client alive, client->server dead —
         // would look healthy forever while keystrokes vanished.
-        let mut probes = ProbeScheduler::new(Instant::now());
-        let mut next_nonce = 1u64;
-        let mut stale_since: Option<Instant> = None;
-        // Set once staleness outlives STALE_CORROBORATED_AFTER; gates input
-        // dropping and the resync on return.
-        let mut stale_corroborated = false;
-        // Connection state held back while the path is corroborated dead, one
-        // entry per message kind, replayed before the recovery SyncRequest.
-        let mut deferred_state = DeferredState::default();
-        let mut rebound_at: Option<Instant> = None;
+        let mut monitor = PathMonitor::new(Instant::now());
         let mut render_generation = 0u64;
         let mut last_state_revision = 0u64;
         let mut expected_seq = 1u64;
         let mut connected_announced = !reconnecting;
         let mut pending_renders = VecDeque::<RemoteQuicRenderRecord>::new();
-
         loop {
             tokio::select! {
                 input = input_rx.recv() => {
                     let Some(input) = input else {
                         return SessionExit::RetryFresh("local client input channel closed".to_owned());
                     };
-                    let detached = matches!(input, ClientMessage::Detach);
                     // While the path is corroborated dead, only Detach still
                     // goes out. Ephemeral input is dropped rather than
                     // delivered late against a screen that has moved on;
@@ -520,32 +634,25 @@ impl QuicSession {
                     // corroboration is already owned by quinn's reliable
                     // stream and will be retransmitted when the path returns.
                     // Revoking that needs input on its own resettable stream.
-                    let input = if stale_corroborated {
-                        match deferred_state.hold(input) {
-                            // Absorbed: dropped as ephemeral, or held for
-                            // replay before the recovery SyncRequest.
-                            None => continue,
-                            // Only Detach declines to be held.
-                            Some(detach) => {
-                                // The user asked to leave. Do not let a dead
-                                // path hold the session open for the write
-                                // deadline, and never turn a detach into a
-                                // reconnect.
-                                let _ = tokio::time::timeout(
-                                    DETACH_NOTIFY_TIMEOUT,
-                                    write_async_message(
-                                        &mut self.control_send,
-                                        &detach,
-                                        MAX_FRAME_SIZE,
-                                    ),
-                                )
-                                .await;
-                                let _ = self.control_send.finish();
-                                return SessionExit::Detached;
-                            }
+                    let (input, detached) = match monitor.filter_input(input) {
+                        FilteredInput::Deliver(msg) => {
+                            let detached = matches!(msg, ClientMessage::Detach);
+                            (msg, detached)
                         }
-                    } else {
-                        input
+                        FilteredInput::Absorbed => continue,
+                        FilteredInput::Detach(detach) => {
+                            let _ = tokio::time::timeout(
+                                DETACH_NOTIFY_TIMEOUT,
+                                write_async_message(
+                                    &mut self.control_send,
+                                    &detach,
+                                    MAX_FRAME_SIZE,
+                                ),
+                            )
+                            .await;
+                            let _ = self.control_send.finish();
+                            return SessionExit::Detached;
+                        }
                     };
                     match tokio::time::timeout(
                         HEARTBEAT_DEADLINE,
@@ -565,25 +672,16 @@ impl QuicSession {
                         let _ = self.control_send.finish();
                         return SessionExit::Detached;
                     }
-                    // Typing starts the liveness clock. Without this, a path
-                    // that died during sleep stays "healthy" until the next
-                    // scheduled probe and swallows everything typed meanwhile.
-                    // The guard keeps this to one probe per round trip no
-                    // matter how fast the user types; the scheduler judges it
-                    // on the same deadline as any other probe.
-                    if !probes.probe_outstanding() {
-                        let nonce = next_nonce;
-                        next_nonce = next_nonce.saturating_add(1);
+                    if let Some(probe) = monitor.maybe_input_probe(Instant::now()) {
                         if let Err(error) = write_async_message(
                             &mut self.control_send,
-                            &ClientMessage::RemotePing { nonce },
+                            &probe,
                             MAX_FRAME_SIZE,
                         )
                         .await
                         {
                             return SessionExit::RetryFresh(error);
                         }
-                        probes.on_probe_sent(Instant::now());
                     }
                 }
                 event = control_event_rx.recv() => {
@@ -592,43 +690,39 @@ impl QuicSession {
                     };
                     match event {
                         ControlEvent::Message(ServerMessage::RemotePong { nonce: _ }) => {
-                            // Any pong proves liveness now, so it retires every
-                            // outstanding probe regardless of which it answers.
-                            probes.on_pong();
-                            stale_since = None;
-                            rebound_at = None;
-                            if std::mem::take(&mut stale_corroborated) {
-                                // Mode transition then geometry, before the
-                                // SyncRequest: the full redraw it triggers must
-                                // be generated against the state the user
-                                // actually has, or recovery paints the
-                                // pre-outage surface and dimensions.
-                                let replay: Vec<ClientMessage> =
-                                    deferred_state.replay().collect();
-                                for message in replay {
+                            match monitor.on_pong() {
+                                PongOutcome::Healthy => {}
+                                PongOutcome::Recovered { replay } => {
+                                    // Mode transition then geometry, before the
+                                    // SyncRequest: the full redraw it triggers must
+                                    // be generated against the state the user
+                                    // actually has, or recovery paints the
+                                    // pre-outage surface and dimensions.
+                                    for message in replay {
+                                        if let Err(error) = write_async_message(
+                                            &mut self.control_send,
+                                            &message,
+                                            MAX_GRAPHICS_FRAME_SIZE,
+                                        )
+                                        .await
+                                        {
+                                            return SessionExit::RetryFresh(error);
+                                        }
+                                    }
+                                    // Input was dropped while dark, so the pane may
+                                    // no longer reflect what the server rendered.
+                                    // Ask for a fresh generation now the path is
+                                    // back; a request sent while dark was queued
+                                    // behind the stall, not delivered.
                                     if let Err(error) = write_async_message(
                                         &mut self.control_send,
-                                        &message,
-                                        MAX_GRAPHICS_FRAME_SIZE,
+                                        &ClientMessage::SyncRequest,
+                                        MAX_FRAME_SIZE,
                                     )
                                     .await
                                     {
                                         return SessionExit::RetryFresh(error);
                                     }
-                                }
-                                // Input was dropped while dark, so the pane may
-                                // no longer reflect what the server rendered.
-                                // Ask for a fresh generation now the path is
-                                // back; a request sent while dark was queued
-                                // behind the stall, not delivered.
-                                if let Err(error) = write_async_message(
-                                    &mut self.control_send,
-                                    &ClientMessage::SyncRequest,
-                                    MAX_FRAME_SIZE,
-                                )
-                                .await
-                                {
-                                    return SessionExit::RetryFresh(error);
                                 }
                             }
                         }
@@ -755,54 +849,50 @@ impl QuicSession {
                     }
                 }
                 _ = tokio::time::sleep_until(tokio::time::Instant::from_std(
-                    probes.wake_at(stale_since, Instant::now()),
+                    monitor.wake_at(Instant::now()),
                 )) => {
                     let now = Instant::now();
-                    let silence = probes.silence(now);
-
-                    if let Some(silence) = silence {
-                        if silence >= PATH_LOST_AFTER {
+                    match monitor.on_tick(now) {
+                        TickOutcome::Lost { silence } => {
                             return SessionExit::RetryFresh(format!(
                                 "remote QUIC path silent for {silence:?}"
                             ));
                         }
-                        if silence >= PATH_STALE_AFTER && stale_since.is_none() {
-                            stale_since = Some(now);
-                            connected_announced = false;
-                            let _ = output.send(ServerMessage::TransportStatus {
-                                status: RemoteTransportStatus::PathRecovering,
-                                detail: Some("waiting for the remote path".to_owned()),
-                            }).await;
-                        }
-                        if silence >= STALE_CORROBORATED_AFTER {
-                            stale_corroborated = true;
-                        }
-                        if silence >= REBIND_AFTER && rebound_at.is_none() {
-                            rebound_at = Some(now);
-                            if let Err(error) = rebind_endpoint(
-                                &self.endpoint,
-                                self.connection.remote_address().ip(),
-                            ) {
-                                return SessionExit::RetryFresh(format!(
-                                    "failed to rebind QUIC path: {error}"
-                                ));
+                        TickOutcome::Probe {
+                            message,
+                            announce_recovering,
+                            needs_rebind,
+                        } => {
+                            if announce_recovering {
+                                connected_announced = false;
+                                let _ = output
+                                    .send(ServerMessage::TransportStatus {
+                                        status: RemoteTransportStatus::PathRecovering,
+                                        detail: Some("waiting for the remote path".to_owned()),
+                                    })
+                                    .await;
+                            }
+                            if needs_rebind {
+                                if let Err(error) = rebind_endpoint(
+                                    &self.endpoint,
+                                    self.connection.remote_address().ip(),
+                                ) {
+                                    return SessionExit::RetryFresh(format!(
+                                        "failed to rebind QUIC path: {error}"
+                                    ));
+                                }
+                            }
+                            if let Err(error) = write_async_message(
+                                &mut self.control_send,
+                                &message,
+                                MAX_FRAME_SIZE,
+                            )
+                            .await
+                            {
+                                return SessionExit::RetryFresh(error);
                             }
                         }
                     }
-
-                    let nonce = next_nonce;
-                    next_nonce = next_nonce.saturating_add(1);
-                    if let Err(error) = write_async_message(
-                        &mut self.control_send,
-                        &ClientMessage::RemotePing { nonce },
-                        MAX_FRAME_SIZE,
-                    ).await {
-                        return SessionExit::RetryFresh(error);
-                    }
-                    // Sending sets this probe's own judge deadline, so a
-                    // heartbeat-originated probe is evaluated on the same
-                    // FAST_PROBE_INTERVAL an input-originated one gets.
-                    probes.on_probe_sent(now);
                 }
                 error = self.connection.closed() => {
                     let detail = error.to_string();
@@ -1098,16 +1188,24 @@ mod tests {
     #[test]
     fn the_first_probe_is_due_immediately_then_once_per_heartbeat() {
         let now = Instant::now();
-        let mut probes = ProbeScheduler::new(now);
+        let mut monitor = PathMonitor::new(now);
         assert_eq!(
-            probes.wake_at(None, now),
+            monitor.wake_at(now),
             now,
             "liveness must be measured from connect, not one interval later"
         );
-        probes.on_probe_sent(now);
-        probes.on_pong();
+        let tick = monitor.on_tick(now);
         assert_eq!(
-            probes.wake_at(None, now),
+            tick,
+            TickOutcome::Probe {
+                message: ClientMessage::RemotePing { nonce: 1 },
+                announce_recovering: false,
+                needs_rebind: false,
+            }
+        );
+        assert_eq!(monitor.on_pong(), PongOutcome::Healthy);
+        assert_eq!(
+            monitor.wake_at(now),
             now + HEARTBEAT_INTERVAL,
             "an idle healthy path must not be probed more often than this"
         );
@@ -1116,14 +1214,14 @@ mod tests {
     #[test]
     fn every_probe_is_judged_on_the_fast_deadline_whatever_prompted_it() {
         let sent = Instant::now();
-        let mut probes = ProbeScheduler::new(sent);
-        probes.on_probe_sent(sent);
+        let mut monitor = PathMonitor::new(sent);
+        monitor.on_probe_sent(sent);
         // The bug this pins: deciding cadence before sending left a
         // heartbeat-originated probe unjudged for a whole HEARTBEAT_INTERVAL
         // while an input-originated one was judged in FAST_PROBE_INTERVAL.
-        assert_eq!(probes.wake_at(None, sent), sent + FAST_PROBE_INTERVAL);
+        assert_eq!(monitor.wake_at(sent), sent + FAST_PROBE_INTERVAL);
         assert_eq!(
-            probes.silence(sent + Duration::from_secs(1)),
+            monitor.silence(sent + Duration::from_secs(1)),
             Some(Duration::from_secs(1))
         );
     }
@@ -1131,24 +1229,24 @@ mod tests {
     #[test]
     fn a_pong_returns_the_path_to_the_healthy_cadence() {
         let sent = Instant::now();
-        let mut probes = ProbeScheduler::new(sent);
-        probes.on_probe_sent(sent);
-        probes.on_pong();
-        assert!(!probes.probe_outstanding());
-        assert_eq!(probes.silence(sent + Duration::from_secs(9)), None);
+        let mut monitor = PathMonitor::new(sent);
+        monitor.on_probe_sent(sent);
+        assert_eq!(monitor.on_pong(), PongOutcome::Healthy);
+        assert!(!monitor.probe_outstanding());
+        assert_eq!(monitor.silence(sent + Duration::from_secs(9)), None);
         // Measured from the probe that was sent, so one keystroke cannot pin
         // the connection at the fast cadence.
-        assert_eq!(probes.wake_at(None, sent), sent + HEARTBEAT_INTERVAL);
+        assert_eq!(monitor.wake_at(sent), sent + HEARTBEAT_INTERVAL);
     }
 
     #[test]
     fn the_oldest_unanswered_probe_measures_silence() {
         let first = Instant::now();
-        let mut probes = ProbeScheduler::new(first);
-        probes.on_probe_sent(first);
-        probes.on_probe_sent(first + Duration::from_secs(1));
+        let mut monitor = PathMonitor::new(first);
+        monitor.on_probe_sent(first);
+        monitor.on_probe_sent(first + Duration::from_secs(1));
         assert_eq!(
-            probes.silence(first + Duration::from_secs(2)),
+            monitor.silence(first + Duration::from_secs(2)),
             Some(Duration::from_secs(2)),
             "a newer probe must not reset the silence the older one proves"
         );
@@ -1157,18 +1255,129 @@ mod tests {
     #[test]
     fn probing_backs_off_only_after_the_fast_window() {
         let sent = Instant::now();
-        let mut probes = ProbeScheduler::new(sent);
-        probes.on_probe_sent(sent);
-        let just_stale = sent - (FAST_PROBE_WINDOW - Duration::from_millis(1));
+        let mut monitor = PathMonitor::new(sent);
+        monitor.on_probe_sent(sent);
+        let stale_at = sent + PATH_STALE_AFTER;
+        let _ = monitor.on_tick(stale_at);
+        assert!(monitor.stale_since.is_some());
+
+        let just_stale = stale_at + (FAST_PROBE_WINDOW - Duration::from_millis(1));
+        assert_eq!(monitor.wake_at(just_stale), stale_at + FAST_PROBE_INTERVAL);
+        let long_stale = stale_at + FAST_PROBE_WINDOW;
         assert_eq!(
-            probes.wake_at(Some(just_stale), sent),
-            sent + FAST_PROBE_INTERVAL
-        );
-        let long_stale = sent - FAST_PROBE_WINDOW;
-        assert_eq!(
-            probes.wake_at(Some(long_stale), sent),
-            sent + SLOW_PROBE_INTERVAL,
+            monitor.wake_at(long_stale),
+            stale_at + SLOW_PROBE_INTERVAL,
             "a long outage must stop holding the radio awake at 2 Hz"
+        );
+    }
+
+    #[test]
+    fn path_monitor_outage_lifecycle_and_recovery() {
+        let now = Instant::now();
+        let mut monitor = PathMonitor::new(now);
+
+        // 1. Initial connect tick sends probe 1 immediately
+        assert_eq!(monitor.wake_at(now), now);
+        let tick = monitor.on_tick(now);
+        assert_eq!(
+            tick,
+            TickOutcome::Probe {
+                message: ClientMessage::RemotePing { nonce: 1 },
+                announce_recovering: false,
+                needs_rebind: false,
+            }
+        );
+        assert!(!monitor.is_stale_corroborated());
+
+        // Normal typing when path is healthy delivers directly and does not send duplicate probe
+        assert_eq!(
+            monitor.filter_input(resize(80)),
+            FilteredInput::Deliver(resize(80))
+        );
+        assert!(monitor
+            .maybe_input_probe(now + Duration::from_millis(100))
+            .is_none());
+
+        // 2. Advance to PATH_STALE_AFTER (1s): announces recovering, but not yet corroborated
+        let t1 = now + PATH_STALE_AFTER;
+        let tick = monitor.on_tick(t1);
+        assert_eq!(
+            tick,
+            TickOutcome::Probe {
+                message: ClientMessage::RemotePing { nonce: 2 },
+                announce_recovering: true,
+                needs_rebind: false,
+            }
+        );
+        assert!(!monitor.is_stale_corroborated());
+
+        // 3. Advance to STALE_CORROBORATED_AFTER (2s): corroborated dead
+        let t2 = now + STALE_CORROBORATED_AFTER;
+        let tick = monitor.on_tick(t2);
+        assert_eq!(
+            tick,
+            TickOutcome::Probe {
+                message: ClientMessage::RemotePing { nonce: 3 },
+                announce_recovering: false,
+                needs_rebind: false,
+            }
+        );
+        assert!(monitor.is_stale_corroborated());
+
+        // While corroborated, ephemeral input is dropped, geometry is deferred, detach is returned
+        assert_eq!(
+            monitor.filter_input(ClientMessage::Input { data: vec![b'x'] }),
+            FilteredInput::Absorbed
+        );
+        assert_eq!(monitor.filter_input(resize(120)), FilteredInput::Absorbed);
+        assert_eq!(
+            monitor.filter_input(ClientMessage::Detach),
+            FilteredInput::Detach(ClientMessage::Detach)
+        );
+
+        // 4. Advance to REBIND_AFTER (10s): requests socket rebind once
+        let t10 = now + REBIND_AFTER;
+        let tick = monitor.on_tick(t10);
+        assert_eq!(
+            tick,
+            TickOutcome::Probe {
+                message: ClientMessage::RemotePing { nonce: 4 },
+                announce_recovering: false,
+                needs_rebind: true,
+            }
+        );
+        // Next tick after rebind does not request rebind again
+        let t11 = t10 + Duration::from_secs(1);
+        let tick = monitor.on_tick(t11);
+        assert_eq!(
+            tick,
+            TickOutcome::Probe {
+                message: ClientMessage::RemotePing { nonce: 5 },
+                announce_recovering: false,
+                needs_rebind: false,
+            }
+        );
+
+        // 5. Pong arrives! Path recovers and replays deferred geometry
+        let pong = monitor.on_pong();
+        assert_eq!(
+            pong,
+            PongOutcome::Recovered {
+                replay: vec![resize(120)]
+            }
+        );
+        assert!(!monitor.is_stale_corroborated());
+        assert!(!monitor.probe_outstanding());
+        assert_eq!(monitor.wake_at(t11), t11 + HEARTBEAT_INTERVAL);
+
+        // 6. Check lost outcome after PATH_LOST_AFTER
+        monitor.on_probe_sent(t11);
+        let t_lost = t11 + PATH_LOST_AFTER;
+        assert_eq!(
+            monitor.on_tick(t_lost),
+            TickOutcome::Lost {
+                silence: PATH_LOST_AFTER
+            }
         );
     }
 
