@@ -122,6 +122,53 @@ impl ClientWriter {
         });
         writer
     }
+
+    /// A writer over the production `ClientWriterQueue`, with no test
+    /// shortcut: renders pass through the same single-slot
+    /// `try_send_render` acceptance gate real clients get, so accepted
+    /// counts and coalescing match production. Callers drain the returned
+    /// queue exactly as `client_writer_loop` does.
+    ///
+    /// Prefer this over `test_channel` whenever acceptance behaviour is
+    /// part of what is being measured; `test_channel` bypasses the queue to
+    /// hand every render straight to a channel.
+    #[cfg(test)]
+    pub(crate) fn test_queue() -> (Self, TestQueueDrain) {
+        let queue = ClientWriterQueue::new();
+        (
+            Self {
+                control: ClientControlWriter::queue(queue.clone()),
+                render: ClientRenderWriter::queue(queue.clone()),
+            },
+            TestQueueDrain { queue },
+        )
+    }
+}
+
+/// Writer-side half of [`ClientWriter::test_queue`]: hands out framed bytes in
+/// the order `client_writer_loop` would write them, without exposing the queue
+/// internals. Keeps `ClientWriterQueue`, `ClientWriteItem`, and their methods
+/// private to this module.
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct TestQueueDrain {
+    queue: Arc<ClientWriterQueue>,
+}
+
+#[cfg(test)]
+impl TestQueueDrain {
+    /// Blocks for the next framed message, control or render, or returns
+    /// `None` once every sender is gone.
+    pub(crate) fn recv(&self) -> Option<Vec<u8>> {
+        self.queue.recv().map(|item| match item {
+            ClientWriteItem::Control(data) | ClientWriteItem::Render(data) => data,
+        })
+    }
+
+    /// Marks the writer side dead, exactly as a disconnected client does.
+    pub(crate) fn close(&self) {
+        self.queue.close_writer();
+    }
 }
 
 #[derive(Debug)]

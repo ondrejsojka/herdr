@@ -21,6 +21,7 @@ use crate::protocol::{
     REMOTE_QUIC_MAX_RESOURCE_INVENTORY, REMOTE_QUIC_MAX_RESOURCE_SIZE, REMOTE_QUIC_TOKEN_BYTES,
 };
 use crate::remote::frame::{hash_bytes, lock, read_async_message, write_async_message};
+use crate::remote::quic_policy::{PRIORITY_CONTROL, PRIORITY_RENDER, PRIORITY_RESOURCE};
 
 use crate::server::client_transport::{
     clamp_terminal_size, client_message_to_event, parse_client_keybindings, ClientWriter,
@@ -35,6 +36,9 @@ const MAX_RESOURCE_REFS_PER_FRAME: usize = 1024;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const TOKEN_MIN_LIFETIME: Duration = Duration::from_secs(60);
 const TOKEN_MAX_LIFETIME: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+// Flow-control caps, not allocations; see the client-side note in
+// src/remote/quic.rs. Sized for the render stream's burst, which carries
+// multi-MB graphics frames, not for one high-latency link profile.
 const QUIC_SEND_WINDOW: u64 = 4 * 1024 * 1024;
 const QUIC_STREAM_RECEIVE_WINDOW: u32 = 256 * 1024;
 const QUIC_RECEIVE_WINDOW: u32 = 1024 * 1024;
@@ -239,7 +243,11 @@ fn transport_config(idle_timeout: Duration) -> Result<quinn::TransportConfig, io
         .max_concurrent_uni_streams(VarInt::from_u32(0))
         .stream_receive_window(VarInt::from_u32(QUIC_STREAM_RECEIVE_WINDOW))
         .receive_window(VarInt::from_u32(QUIC_RECEIVE_WINDOW))
-        .send_window(QUIC_SEND_WINDOW);
+        .send_window(QUIC_SEND_WINDOW)
+        // See the matching note in src/remote/quic.rs: BBR paces to measured
+        // bottleneck bandwidth, so random loss on a mobile path does not
+        // collapse the send window the way loss-based Cubic does.
+        .congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
     Ok(transport)
 }
 
@@ -333,6 +341,12 @@ async fn serve_connection(connection: Connection, state: Arc<ServerState>) -> Re
             .await
             .map_err(|_| "timed out waiting for QUIC control stream".to_owned())?
             .map_err(|err| format!("failed to accept QUIC control stream: {err}"))?;
+    // Server->client half of the control stream: pongs, welcome, and detach
+    // notices must outrank the render and resource streams for the same
+    // reason the client prioritizes its half.
+    // A closed stream surfaces on the next write; priority is an
+    // optimization, so it does not warrant a separate error path.
+    let _ = control_send.set_priority(PRIORITY_CONTROL);
     let hello: RemoteQuicHello = tokio::time::timeout(
         HANDSHAKE_TIMEOUT,
         read_async_message(&mut control_recv, MAX_FRAME_SIZE),
@@ -943,6 +957,11 @@ async fn publish_render(
             Ok(stream) => stream,
             Err(_) => return PublishRenderResult::Closed,
         };
+        // Ranked below graphics resources, not above them: the client cannot
+        // apply a record that references an uncached resource, so starving the
+        // resource would stall this stream's own records. See
+        // PRIORITY_CONTROL.
+        let _ = stream.set_priority(PRIORITY_RENDER);
         let header = RemoteQuicStreamHeader::Render {
             connection_generation,
             render_generation,
@@ -991,6 +1010,10 @@ fn spawn_resource_transfer(
         let Ok(mut stream) = connection.open_uni().await else {
             return;
         };
+        // Above the render stream: a render record referencing this hash is
+        // unapplicable until these bytes land, and the client's pending-render
+        // queue is bounded, so starving this transfer forces a reconnect.
+        let _ = stream.set_priority(PRIORITY_RESOURCE);
         let Ok(length) = u32::try_from(bytes.len()) else {
             return;
         };

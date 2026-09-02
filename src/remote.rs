@@ -9,6 +9,9 @@ pub(crate) mod frame;
 mod quic;
 
 #[cfg(unix)]
+pub(crate) mod quic_policy;
+
+#[cfg(unix)]
 mod host_unix;
 #[cfg(unix)]
 mod proxy;
