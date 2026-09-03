@@ -1935,15 +1935,8 @@ async fn run_client_loop(
                         detail = detail.as_deref().unwrap_or_default(),
                         "remote transport status changed"
                     );
-                    state.transport_stale =
-                        status != crate::protocol::RemoteTransportStatus::Connected;
-                    if state.transport_stale {
-                        write_remote_transport_status(
-                            status,
-                            detail.as_deref(),
-                            state.reported_size.1,
-                        );
-                    }
+                    state.transport_stale = transport_stale_for(status);
+                    write_remote_transport_status(status, detail.as_deref(), state.reported_size.1);
                 }
                 ServerMessage::RemotePong { .. } => {
                     debug!("received unexpected remote heartbeat in main loop");
@@ -2396,6 +2389,28 @@ fn forward_clipboard(data: &str) {
     };
 
     crate::selection::write_osc52_bytes(&bytes);
+}
+
+/// Whether local pane input must be dropped rather than written to the proxy.
+///
+/// Only true once the QUIC session is gone and the proxy is dialing again:
+/// there is no stream to carry a keystroke, and anything written now would
+/// either be lost or replayed into a session whose screen the user never saw.
+///
+/// `PathRecovering` is deliberately not stale. The connection is still up —
+/// the app-level probe merely went unanswered — and the control stream is
+/// reliable and ordered, so QUIC either delivers the keystroke when the path
+/// returns or the session ends and the proxy moves to one of the reconnecting
+/// statuses below. Gating here would silently eat typing for up to
+/// `PATH_LOST_AFTER` on a link that is only briefly slow.
+fn transport_stale_for(status: crate::protocol::RemoteTransportStatus) -> bool {
+    match status {
+        crate::protocol::RemoteTransportStatus::Connected
+        | crate::protocol::RemoteTransportStatus::PathRecovering => false,
+        crate::protocol::RemoteTransportStatus::FreshQuicConnecting
+        | crate::protocol::RemoteTransportStatus::SshRebootstrap
+        | crate::protocol::RemoteTransportStatus::SshFallbackConnecting => true,
+    }
 }
 
 fn write_remote_transport_status(
@@ -3412,6 +3427,35 @@ mod tests {
             "should mention shutdown: {msg}"
         );
         assert!(msg.contains("maintenance"), "should include reason: {msg}");
+    }
+
+    /// Input gating is the difference between "your keystroke arrives late"
+    /// and "your keystroke is gone". Only the statuses that mean the QUIC
+    /// session itself is gone may discard it: `PathRecovering` still has a
+    /// reliable, ordered control stream underneath it.
+    #[test]
+    fn only_a_lost_session_gates_local_input() {
+        use crate::protocol::RemoteTransportStatus;
+
+        for status in [
+            RemoteTransportStatus::Connected,
+            RemoteTransportStatus::PathRecovering,
+        ] {
+            assert!(
+                !transport_stale_for(status),
+                "{status:?} still has a live connection to carry input"
+            );
+        }
+        for status in [
+            RemoteTransportStatus::FreshQuicConnecting,
+            RemoteTransportStatus::SshRebootstrap,
+            RemoteTransportStatus::SshFallbackConnecting,
+        ] {
+            assert!(
+                transport_stale_for(status),
+                "{status:?} has no stream to deliver input on"
+            );
+        }
     }
 
     #[test]

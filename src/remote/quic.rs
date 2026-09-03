@@ -11,7 +11,10 @@ use tokio::sync::mpsc;
 use tracing::debug;
 
 use super::frame::{hash_bytes, lock, read_async_message, write_async_message};
-use super::quic_policy::PRIORITY_CONTROL;
+use super::quic_policy::{
+    PRIORITY_CONTROL, REMOTE_QUIC_CLOSE_AUTH, REMOTE_QUIC_CLOSE_EVICTED,
+    REMOTE_QUIC_CLOSE_PROTOCOL, REMOTE_QUIC_CLOSE_REPLACED, REMOTE_QUIC_CLOSE_SHUTDOWN,
+};
 
 use crate::protocol::{
     ClientKeybindings, ClientLaunchMode, ClientMessage, RemoteBootstrapRecord, RemoteQuicHello,
@@ -23,16 +26,38 @@ use crate::protocol::{
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const CONTROL_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
-const HEARTBEAT_DEADLINE: Duration = Duration::from_secs(3);
-/// Age of the oldest unacknowledged probe at which the path is treated as
-/// stale. Only the status report happens here: it is honest and free.
-const PATH_STALE_AFTER: Duration = Duration::from_secs(1);
-/// Silence required before the *expensive* reactions to staleness — dropping
-/// pane input and forcing a full resync on return. Probes share the
-/// connection-level send window with render streams, so a saturated but live
-/// path can starve a pong for over a second; that must not cost the user
-/// keystrokes. A dead path still corroborates well inside one fast probe.
+/// Deadline for a single write on the reliable control stream. A write that
+/// cannot complete in this long means the stream itself is wedged, which is
+/// not something probing can diagnose. Path liveness is judged from probe
+/// silence alone, never from this.
+const CONTROL_WRITE_DEADLINE: Duration = Duration::from_secs(3);
+/// Silence at which probing switches to `FAST_PROBE_INTERVAL`. Nothing the
+/// user can see happens here: no status change, no change in how input is
+/// handled. Probes into a dead path are free, so this is deliberately eager.
+const FAST_PROBE_AFTER: Duration = Duration::from_secs(1);
+/// Silence required — together with `RECOVERING_MIN_UNANSWERED_PROBES` —
+/// before the path is *presumed dead*: the UI is told it is recovering,
+/// geometry and mode changes are coalesced instead of sent, and a full resync
+/// is forced when the path returns.
+///
+/// Pane input keeps flowing across this threshold. The control stream is
+/// reliable and ordered, so while the connection lives it delivers keystrokes
+/// in order exactly as the old SSH bridge did; input stops only when the
+/// connection is abandoned, which ends the session. What this threshold buys
+/// is the right to *withhold* state and repaint, and that must not fire on a
+/// merely slow path: probes share the connection-level send window with the
+/// render streams, so a saturated but live path can starve a pong for over a
+/// second.
 pub(super) const STALE_CORROBORATED_AFTER: Duration = Duration::from_secs(2);
+/// Consecutive unanswered probes required before presuming the path dead.
+///
+/// Silence alone is not enough evidence, because silence is measured against
+/// a wall clock the peer never agreed to: a delayed timer — a stalled
+/// runtime, a suspended laptop whose monotonic clock skipped the sleep —
+/// can make one outstanding probe look ancient the moment we wake, before the
+/// peer has had a single round trip in which to answer. Two probes means at
+/// least one full fast round happened while we were actually awake.
+const RECOVERING_MIN_UNANSWERED_PROBES: u32 = 2;
 /// Probe cadence while the path is stale, for the first `FAST_PROBE_WINDOW`.
 /// Detecting the path's *return* is the only latency-critical part of an
 /// outage, and probes sent into a dead path cost nothing.
@@ -42,22 +67,42 @@ const FAST_PROBE_INTERVAL: Duration = Duration::from_millis(500);
 const FAST_PROBE_WINDOW: Duration = Duration::from_secs(30);
 /// Probe cadence after `FAST_PROBE_WINDOW` of continuous staleness.
 const SLOW_PROBE_INTERVAL: Duration = Duration::from_secs(2);
-/// Rebind the local socket once, after this much silence. Rebinding answers a
-/// local address change from sleep or roaming; doing it for a brief flap only
-/// forces needless path validation and discards congestion state.
+/// Rebind the local socket after this much silence, and again after every
+/// further `REBIND_AFTER` the silence continues. Rebinding answers a local
+/// address change from sleep or roaming; doing it for a brief flap only
+/// forces needless path validation and discards congestion state, and doing
+/// it *once* per outage strands a sleep -> tether -> wifi sequence on the
+/// second-to-last address.
 const REBIND_AFTER: Duration = Duration::from_secs(10);
-/// Abandon the connection only after this much continuous silence. quinn holds
-/// it far longer via `max_idle_timeout`, and `Connection::closed` reports real
-/// failures, so this covers only a peer that vanished without closing.
+/// Abandon the connection after this much continuous silence. This, not
+/// quinn's idle timeout, is the client's dead-peer bound: the negotiated idle
+/// timeout is the minimum of the two peers' advertised values, so it is the
+/// server's configured `quic_transport_idle_timeout_seconds` — anywhere from
+/// 10 to 600 seconds — and may be far longer than this. `Connection::closed`
+/// still reports real failures immediately; this covers only a peer that keeps
+/// the transport nominally alive while never answering a probe.
 const PATH_LOST_AFTER: Duration = Duration::from_secs(120);
 
 const MAX_RESOURCE_CACHE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_RESOURCE_CACHE_ENTRIES: usize = REMOTE_QUIC_MAX_RESOURCE_INVENTORY;
+/// Transport-level idle timeout advertised by the client. Only a backstop: the
+/// application probes every `HEARTBEAT_INTERVAL` and gives up after
+/// `PATH_LOST_AFTER`, so the app, not quinn, owns liveness detection.
+///
+/// The negotiated timeout is min(client, server), so any client value below
+/// the server's would silently override the configured
+/// `quic_transport_idle_timeout_seconds`. Advertising the largest value the
+/// server can be configured with, plus slack, keeps the server's setting the
+/// one that governs across its whole supported range.
+const CLIENT_MAX_IDLE_TIMEOUT: Duration =
+    Duration::from_secs(crate::config::REMOTE_TRANSPORT_IDLE_TIMEOUT_MAX_SECONDS + 10);
 // Flow-control caps, not allocations. They are deliberately generous: the
 // ceiling is send_window/RTT on every path, so shrinking them to suit one
 // high-latency profile would throttle low-RTT attach and stall the multi-MB
-// graphics frames MAX_GRAPHICS_FRAME_SIZE exists to carry.
-const CLIENT_STREAM_RECEIVE_WINDOW: u32 = 512 * 1024;
+// graphics frames MAX_GRAPHICS_FRAME_SIZE exists to carry. The per-stream
+// window has to cover a full-screen repaint plus an inline graphics payload
+// in flight at once, or a high-BDP path blocks the render stream mid-frame.
+const CLIENT_STREAM_RECEIVE_WINDOW: u32 = 2 * 1024 * 1024;
 const CLIENT_RECEIVE_WINDOW: u32 = 8 * 1024 * 1024;
 const CLIENT_SEND_WINDOW: u64 = 1024 * 1024;
 const MAX_PENDING_RENDER_RECORDS: usize = 8;
@@ -66,18 +111,24 @@ const MAX_PENDING_RENDER_RECORDS: usize = 8;
 /// way, and the server reaps the session on its own.
 const DETACH_NOTIFY_TIMEOUT: Duration = Duration::from_millis(250);
 
-/// How a `ClientMessage` is treated while the path is known to be unreliable.
+/// How a `ClientMessage` is treated once the path is presumed dead but the
+/// QUIC connection is still alive.
 ///
 /// The input channel is heterogeneous: it carries ephemeral keystrokes,
 /// connection-lifetime state, and a graceful-exit request. Treating all of it
-/// as keystrokes either replays input into the wrong screen or silently loses
-/// geometry and mode changes the server needs to stay correct.
+/// as keystrokes silently loses geometry and mode changes the server needs to
+/// stay correct; treating all of it as state withholds the user's typing from
+/// a stream that is still perfectly capable of delivering it.
 #[derive(Debug, PartialEq, Eq)]
 enum StalePolicy {
-    /// Positional and only meaningful against the screen that produced it, so
-    /// it is dropped rather than delivered late.
-    DropEphemeral,
-    /// Terminal geometry. A state: the newest value is the whole truth.
+    /// Positional, and the wire is the only thing that can decide whether it
+    /// still applies. Handed straight to the reliable control stream: while
+    /// the connection lives, QUIC delivers it in order, exactly as the SSH
+    /// bridge it replaces did. Uncertain input is discarded only by
+    /// abandoning the connection, which ends the session and never replays.
+    DeliverEphemeral,
+    /// Terminal geometry. A state: the newest value is the whole truth, so
+    /// intermediate values are coalesced away rather than streamed.
     DeferResize,
     /// A terminal-mode transition (`AttachTerminal`, `ObserveTerminal`,
     /// `ControlTerminal`). These are commands with validation and ownership
@@ -96,21 +147,23 @@ fn stale_policy(message: &ClientMessage) -> StalePolicy {
         ClientMessage::AttachTerminal { .. }
         | ClientMessage::ObserveTerminal { .. }
         | ClientMessage::ControlTerminal { .. } => StalePolicy::DeferTerminalMode,
-        // Keystrokes, mouse reports, scrolls, and pastes are positional.
+        // Keystrokes, mouse reports, scrolls, and pastes. Positional, and the
+        // user is entitled to have them arrive if the stream can carry them.
         ClientMessage::Input { .. }
         | ClientMessage::InputEvents { .. }
         | ClientMessage::InputPixels { .. }
         | ClientMessage::AttachScroll { .. }
-        | ClientMessage::ClipboardImage { .. } => StalePolicy::DropEphemeral,
-        // These answer a specific in-flight transfer. The outage ended that
-        // transfer, and the recovery redraw re-drives graphics from scratch.
+        | ClientMessage::ClipboardImage { .. } => StalePolicy::DeliverEphemeral,
+        // These answer a specific in-flight transfer, which the recovery
+        // redraw re-drives from scratch; ordered late delivery is harmless
+        // and cheaper to reason about than a second dropping rule.
         ClientMessage::GraphicsTransmissionResult { .. }
-        | ClientMessage::GraphicsTransmissionStarted { .. } => StalePolicy::DropEphemeral,
+        | ClientMessage::GraphicsTransmissionStarted { .. } => StalePolicy::DeliverEphemeral,
         // Handshake-only or generated inside this loop; never arrives here.
         ClientMessage::Hello { .. }
         | ClientMessage::RemoteBootstrap(_)
         | ClientMessage::RemotePing { .. }
-        | ClientMessage::SyncRequest => StalePolicy::DropEphemeral,
+        | ClientMessage::SyncRequest => StalePolicy::DeliverEphemeral,
     }
 }
 
@@ -126,24 +179,25 @@ struct DeferredState {
     terminal_mode: Option<ClientMessage>,
 }
 impl DeferredState {
-    /// Absorbs `message` when the stale path allows it, returning `None`.
-    /// Returns the message back only when it must still be acted on — today
-    /// exclusively `Detach`.
-    fn hold(&mut self, message: ClientMessage) -> Option<ClientMessage> {
+    /// Classifies `message` against the presumed-dead path: coalescable
+    /// connection state is absorbed for replay on recovery, and everything
+    /// else is handed back for immediate delivery on the still-live control
+    /// stream (or, for `Detach`, for the local exit path).
+    fn hold(&mut self, message: ClientMessage) -> FilteredInput {
         match stale_policy(&message) {
             StalePolicy::DeferResize => {
                 self.resize = Some(message);
-                None
+                FilteredInput::Absorbed
             }
             // Newest transition replaces any earlier one, across variants:
             // replaying observe-then-control would be rejected as an
             // upgrade and disconnect the client.
             StalePolicy::DeferTerminalMode => {
                 self.terminal_mode = Some(message);
-                None
+                FilteredInput::Absorbed
             }
-            StalePolicy::DropEphemeral => None,
-            StalePolicy::Detach => Some(message),
+            StalePolicy::DeliverEphemeral => FilteredInput::Deliver(message),
+            StalePolicy::Detach => FilteredInput::Detach(message),
         }
     }
 
@@ -168,7 +222,7 @@ impl DeferredState {
 pub(crate) enum FilteredInput {
     /// Deliver this input message over the live transport.
     Deliver(ClientMessage),
-    /// Absorbed: dropped as ephemeral, or deferred for replay on recovery.
+    /// Absorbed: coalesced into the deferred state for replay on recovery.
     Absorbed,
     /// User requested detach while dark; notify best-effort and exit.
     Detach(ClientMessage),
@@ -202,35 +256,53 @@ pub(crate) enum TickOutcome {
 ///
 /// Owns both probe deadlines (when to send the next probe on a healthy path,
 /// and when to judge a probe that has gone unanswered), silence-driven
-/// thresholds (announcing path recovery, corroborating staleness, socket rebind,
-/// and connection abandonment), and the deferred input state withheld while dark.
+/// thresholds (announcing path recovery, presuming the path dead, socket
+/// rebind, and connection abandonment), and the connection state coalesced
+/// while the path is presumed dead.
 #[derive(Debug)]
 pub(crate) struct PathMonitor {
     /// When the last probe was sent. Drives scheduling only.
     last_probe_at: Instant,
     /// Send time of the oldest probe no pong has retired yet. Drives silence only.
     oldest_unacked_at: Option<Instant>,
-    /// Instant when silence first exceeded PATH_STALE_AFTER.
-    stale_since: Option<Instant>,
-    /// Set once silence exceeds STALE_CORROBORATED_AFTER; gates input dropping
-    /// and recovery replay on return.
+    /// How many probes have been sent since the last pong. Corroborates
+    /// silence, which a delayed timer can otherwise overstate.
+    unanswered_probes: u32,
+    /// Instant when silence first exceeded FAST_PROBE_AFTER, starting the
+    /// fast-probe window.
+    fast_probe_since: Option<Instant>,
+    /// Set once the path is presumed dead; gates state coalescing and the
+    /// recovery replay plus resync on return. Never gates pane input.
     stale_corroborated: bool,
-    /// Instant when endpoint rebind was triggered after REBIND_AFTER.
+    /// Instant of the most recent endpoint rebind, so the next one can be
+    /// re-armed a further REBIND_AFTER into the same outage.
     rebound_at: Option<Instant>,
     /// Nonce sequence for probe messages.
     next_nonce: u64,
-    /// Connection state withheld while the path is corroborated dead.
+    /// Connection state withheld while the path is presumed dead.
     deferred: DeferredState,
 }
 
 impl PathMonitor {
     /// The first probe is due immediately: liveness has to be measured from
     /// connect, not from one HEARTBEAT_INTERVAL later.
+    ///
+    /// Every threshold here is measured with `Instant`, i.e. CLOCK_MONOTONIC,
+    /// which on Linux excludes time the machine spent suspended. A laptop that
+    /// sleeps for an hour therefore measures ~0 silence on wake, no matter how
+    /// long the peer has actually been unreachable: nothing in this type can
+    /// detect the outage until the first post-wake probe round trip fails,
+    /// which is why detection is driven by probe *responses* rather than by
+    /// elapsed time, and why `RECOVERING_MIN_UNANSWERED_PROBES` refuses to act
+    /// on a single stale-looking probe. Deliberate: CLOCK_BOOTTIME would
+    /// report the sleep as silence and announce an outage on a path that is
+    /// fine, and no clock can shorten the one round trip recovery costs.
     pub(crate) fn new(now: Instant) -> Self {
         Self {
             last_probe_at: now.checked_sub(HEARTBEAT_INTERVAL).unwrap_or(now),
             oldest_unacked_at: None,
-            stale_since: None,
+            unanswered_probes: 0,
+            fast_probe_since: None,
             stale_corroborated: false,
             rebound_at: None,
             next_nonce: 1,
@@ -271,7 +343,7 @@ impl PathMonitor {
     /// Long outages back off so a dead radio is not held awake, but only past
     /// the window in which the path plausibly returns soon.
     fn judge_interval(&self, now: Instant) -> Duration {
-        match self.stale_since {
+        match self.fast_probe_since {
             Some(since)
                 if now
                     .checked_duration_since(since)
@@ -287,6 +359,7 @@ impl PathMonitor {
         self.last_probe_at = now;
         // Keep the oldest: it, not the newest, measures the silence.
         self.oldest_unacked_at.get_or_insert(now);
+        self.unanswered_probes = self.unanswered_probes.saturating_add(1);
     }
 
     /// Typing starts the liveness clock if no probe is currently outstanding.
@@ -301,26 +374,29 @@ impl PathMonitor {
         }
     }
 
-    /// Filters client input against path liveness: ephemeral input is dropped
-    /// while corroborated dead, geometry/mode changes are deferred, and detach
-    /// passes through for best-effort delivery.
+    /// Filters client input against path liveness.
+    ///
+    /// Pane input is always delivered: the control stream is reliable and
+    /// ordered, so as long as the connection exists it carries keystrokes in
+    /// order, and withholding them would lose typing on a link that is merely
+    /// slow. Only coalescable connection state (geometry, terminal mode) is
+    /// absorbed while the path is presumed dead, and detach passes through for
+    /// best-effort delivery plus a local exit.
     pub(crate) fn filter_input(&mut self, input: ClientMessage) -> FilteredInput {
         if self.stale_corroborated {
-            match self.deferred.hold(input) {
-                None => FilteredInput::Absorbed,
-                Some(detach) => FilteredInput::Detach(detach),
-            }
+            self.deferred.hold(input)
         } else {
             FilteredInput::Deliver(input)
         }
     }
 
     /// Any pong proves liveness now, so it retires every outstanding probe.
-    /// If the path was corroborated dead, replayed messages are returned
+    /// If the path had been presumed dead, the coalesced state is returned
     /// to be sent before the recovery SyncRequest.
     pub(crate) fn on_pong(&mut self) -> PongOutcome {
         self.oldest_unacked_at = None;
-        self.stale_since = None;
+        self.unanswered_probes = 0;
+        self.fast_probe_since = None;
         self.rebound_at = None;
         if std::mem::take(&mut self.stale_corroborated) {
             PongOutcome::Recovered {
@@ -341,14 +417,31 @@ impl PathMonitor {
             if silence >= PATH_LOST_AFTER {
                 return TickOutcome::Lost { silence };
             }
-            if silence >= PATH_STALE_AFTER && self.stale_since.is_none() {
-                self.stale_since = Some(now);
+            if silence >= FAST_PROBE_AFTER && self.fast_probe_since.is_none() {
+                self.fast_probe_since = Some(now);
+            }
+            // Two independent pieces of evidence, and the transition is
+            // announced exactly once: the probe count is checked before this
+            // tick's own probe is sent, so a timer that fired late still owes
+            // the peer one honest fast round before the UI repaints.
+            if silence >= STALE_CORROBORATED_AFTER
+                && self.unanswered_probes >= RECOVERING_MIN_UNANSWERED_PROBES
+                && !self.stale_corroborated
+            {
+                self.stale_corroborated = true;
                 announce_recovering = true;
             }
-            if silence >= STALE_CORROBORATED_AFTER {
-                self.stale_corroborated = true;
-            }
-            if silence >= REBIND_AFTER && self.rebound_at.is_none() {
+            // Re-armed every REBIND_AFTER of continued silence, not once per
+            // outage: sleep -> tether -> wifi changes the local address more
+            // than once inside a single outage, and only the rebind that
+            // follows the *final* change can recover the connection.
+            let rebind_due = match self.rebound_at {
+                None => silence >= REBIND_AFTER,
+                Some(previous) => now
+                    .checked_duration_since(previous)
+                    .is_some_and(|since| since >= REBIND_AFTER),
+            };
+            if rebind_due {
                 self.rebound_at = Some(now);
                 needs_rebind = true;
             }
@@ -379,6 +472,9 @@ pub(crate) struct ConnectParams {
     pub(crate) keybindings: ClientKeybindings,
 }
 
+/// `Debug` so tests can `expect_err` on `connect`; the derive prints only
+/// quinn handles and counters, never buffered bytes.
+#[derive(Debug)]
 pub(crate) struct QuicSession {
     endpoint: Endpoint,
     connection: Connection,
@@ -392,10 +488,14 @@ pub(crate) struct QuicSession {
 pub(crate) enum SessionExit {
     RetryFresh(String),
     Rebootstrap(String),
+    /// A newer generation of this capability was accepted: another client has
+    /// taken the session over. Terminal — reconnecting would fence the client
+    /// that just won, which would fence this one straight back.
+    Superseded(String),
     Detached,
 }
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub(crate) struct ResourceCache {
     entries: HashMap<[u8; REMOTE_QUIC_HASH_BYTES], Vec<u8>>,
     order: VecDeque<[u8; REMOTE_QUIC_HASH_BYTES]>,
@@ -487,10 +587,21 @@ impl QuicSession {
                 }
             };
             let (mut control_send, mut control_recv) =
-                tokio::time::timeout(CONTROL_HANDSHAKE_TIMEOUT, connection.open_bi())
-                    .await
-                    .map_err(|_| "timed out opening QUIC control stream".to_owned())?
-                    .map_err(|err| format!("failed to open QUIC control stream: {err}"))?;
+                match tokio::time::timeout(CONTROL_HANDSHAKE_TIMEOUT, connection.open_bi()).await {
+                    Ok(Ok(streams)) => streams,
+                    Ok(Err(err)) => {
+                        return Err(abandon(
+                            &endpoint,
+                            format!("failed to open QUIC control stream: {err}"),
+                        ));
+                    }
+                    Err(_) => {
+                        return Err(abandon(
+                            &endpoint,
+                            "timed out opening QUIC control stream".to_owned(),
+                        ));
+                    }
+                };
             // Heartbeats and keystrokes share this stream. Without a priority
             // above the render stream, a saturated link can queue a pong
             // behind a screen repaint for seconds and manufacture a
@@ -513,13 +624,25 @@ impl QuicSession {
                 launch_mode: ClientLaunchMode::App,
                 cached_resources,
             };
-            write_async_message(&mut control_send, &hello, MAX_FRAME_SIZE).await?;
-            let welcome: ServerMessage = tokio::time::timeout(
+            if let Err(error) = write_async_message(&mut control_send, &hello, MAX_FRAME_SIZE).await
+            {
+                return Err(abandon(&endpoint, error));
+            }
+            let welcome: ServerMessage = match tokio::time::timeout(
                 CONTROL_HANDSHAKE_TIMEOUT,
                 read_async_message(&mut control_recv, MAX_FRAME_SIZE),
             )
             .await
-            .map_err(|_| "timed out waiting for remote QUIC welcome".to_owned())??;
+            {
+                Ok(Ok(welcome)) => welcome,
+                Ok(Err(error)) => return Err(abandon(&endpoint, error)),
+                Err(_) => {
+                    return Err(abandon(
+                        &endpoint,
+                        "timed out waiting for remote QUIC welcome".to_owned(),
+                    ));
+                }
+            };
             match &welcome {
                 ServerMessage::Welcome {
                     version,
@@ -531,11 +654,17 @@ impl QuicSession {
                     error: Some(error),
                     ..
                 } => {
-                    return Err(format!(
-                        "remote QUIC server {version} rejected attach: {error}"
+                    return Err(abandon(
+                        &endpoint,
+                        format!("remote QUIC server {version} rejected attach: {error}"),
                     ));
                 }
-                _ => return Err("remote QUIC server sent an invalid welcome".to_owned()),
+                _ => {
+                    return Err(abandon(
+                        &endpoint,
+                        "remote QUIC server sent an invalid welcome".to_owned(),
+                    ))
+                }
             }
             return Ok((
                 Self {
@@ -624,16 +753,21 @@ impl QuicSession {
                     let Some(input) = input else {
                         return SessionExit::RetryFresh("local client input channel closed".to_owned());
                     };
-                    // While the path is corroborated dead, only Detach still
-                    // goes out. Ephemeral input is dropped rather than
-                    // delivered late against a screen that has moved on;
-                    // connection state is held and replayed on recovery so the
-                    // full redraw is generated at the right geometry.
+                    // Pane input keeps flowing for as long as this connection
+                    // exists, presumed-dead path or not: the control stream is
+                    // reliable and ordered, so QUIC either delivers a
+                    // keystroke in order or the connection dies and the
+                    // session ends. Withholding input here would lose typing
+                    // on a link that is merely slow, and dropping it after the
+                    // write is impossible anyway — quinn owns the bytes and
+                    // will retransmit them when the path returns.
                     //
-                    // Best-effort, not a guarantee: anything written before
-                    // corroboration is already owned by quinn's reliable
-                    // stream and will be retransmitted when the path returns.
-                    // Revoking that needs input on its own resettable stream.
+                    // Only coalescable connection state is absorbed (newest
+                    // geometry and terminal mode win) and replayed before the
+                    // recovery resync, so the full redraw is generated at the
+                    // state the user actually has. Uncertain input is never
+                    // replayed across a *new* connection: that path exits the
+                    // session instead.
                     let (input, detached) = match monitor.filter_input(input) {
                         FilteredInput::Deliver(msg) => {
                             let detached = matches!(msg, ClientMessage::Detach);
@@ -655,7 +789,7 @@ impl QuicSession {
                         }
                     };
                     match tokio::time::timeout(
-                        HEARTBEAT_DEADLINE,
+                        CONTROL_WRITE_DEADLINE,
                         write_async_message(&mut self.control_send, &input, MAX_GRAPHICS_FRAME_SIZE),
                     )
                     .await
@@ -686,7 +820,10 @@ impl QuicSession {
                 }
                 event = control_event_rx.recv() => {
                     let Some(event) = event else {
-                        return SessionExit::RetryFresh("remote control reader stopped".to_owned());
+                        return classify_reader_close(
+                            &self.connection,
+                            "remote control reader stopped".to_owned(),
+                        );
                     };
                     match event {
                         ControlEvent::Message(ServerMessage::RemotePong { nonce: _ }) => {
@@ -709,11 +846,12 @@ impl QuicSession {
                                             return SessionExit::RetryFresh(error);
                                         }
                                     }
-                                    // Input was dropped while dark, so the pane may
-                                    // no longer reflect what the server rendered.
-                                    // Ask for a fresh generation now the path is
-                                    // back; a request sent while dark was queued
-                                    // behind the stall, not delivered.
+                                    // Coalesced geometry/mode aside, the
+                                    // server's render generation may have
+                                    // moved on while its frames went nowhere.
+                                    // Ask for a fresh generation now the path
+                                    // is back; a request sent while dark was
+                                    // queued behind the stall, not delivered.
                                     if let Err(error) = write_async_message(
                                         &mut self.control_send,
                                         &ClientMessage::SyncRequest,
@@ -722,6 +860,27 @@ impl QuicSession {
                                     .await
                                     {
                                         return SessionExit::RetryFresh(error);
+                                    }
+                                    // The transport is provably back, so say
+                                    // so here rather than waiting for a frame
+                                    // to flush: the resync above can take a
+                                    // whole round trip plus a full repaint,
+                                    // and leaving "waiting for the remote
+                                    // path" on screen for that long is a lie.
+                                    // Idempotent — flush_pending_renders reads
+                                    // the same flag, so no duplicate status.
+                                    if !connected_announced {
+                                        connected_announced = true;
+                                        if output
+                                            .send(ServerMessage::TransportStatus {
+                                                status: RemoteTransportStatus::Connected,
+                                                detail: None,
+                                            })
+                                            .await
+                                            .is_err()
+                                        {
+                                            return SessionExit::Detached;
+                                        }
                                     }
                                 }
                             }
@@ -740,13 +899,16 @@ impl QuicSession {
                             }
                         }
                         ControlEvent::Closed(error) => {
-                            return SessionExit::RetryFresh(error);
+                            return classify_reader_close(&self.connection, error);
                         }
                     }
                 }
                 event = stream_event_rx.recv() => {
                     let Some(event) = event else {
-                        return SessionExit::RetryFresh("remote stream reader stopped".to_owned());
+                        return classify_reader_close(
+                            &self.connection,
+                            "remote stream reader stopped".to_owned(),
+                        );
                     };
                     match event {
                         StreamEvent::Render(record) => {
@@ -839,6 +1001,13 @@ impl QuicSession {
                             }
                         }
                         StreamEvent::Closed(error) => {
+                            // A stream dies either because the connection
+                            // died or on its own. The former must reach the
+                            // same verdict as the `closed()` arm this event
+                            // races, so ask the connection first.
+                            if let Some(closed) = self.connection.close_reason() {
+                                return classify_close(&closed);
+                            }
                             if !pending_renders.is_empty() {
                                 return SessionExit::RetryFresh(format!(
                                     "remote graphics resource stream failed: {error}"
@@ -895,14 +1064,72 @@ impl QuicSession {
                     }
                 }
                 error = self.connection.closed() => {
-                    let detail = error.to_string();
-                    if detail.contains("capability") || detail.contains("server instance") || detail.contains("protocol") {
-                        return SessionExit::Rebootstrap(detail);
-                    }
-                    return SessionExit::RetryFresh(detail);
+                    return classify_close(&error);
                 }
             }
         }
+    }
+}
+
+/// Releases a client endpoint whose handshake failed, handing `error` back so
+/// the call site stays one expression.
+///
+/// Dropping an `Endpoint` does not close it: its driver task and UDP socket
+/// outlive the handle, so a candidate abandoned mid-handshake would leak both
+/// for the life of the process. The connect-timeout path already closes; every
+/// other exit from `connect` has to as well, and parallel dialing makes the
+/// losers of a race the common case rather than the exception.
+fn abandon(endpoint: &Endpoint, error: String) -> String {
+    endpoint.close(VarInt::from_u32(0), b"handshake abandoned");
+    error
+}
+
+/// Decides whether a closed connection can be retried with the credential we
+/// hold, needs a fresh bootstrap, or must not be reconnected at all.
+///
+/// Keyed on the QUIC application close code, never on the reason string: the
+/// reason is a human-readable diagnostic the server is free to reword, and
+/// matching substrings in it made every log message a load-bearing part of the
+/// protocol. Unknown codes and every transport-level failure retry, because
+/// re-bootstrapping costs an SSH round trip and only helps when the
+/// credential, the protocol, or the server process itself is the problem.
+fn classify_close(error: &quinn::ConnectionError) -> SessionExit {
+    let detail = error.to_string();
+    let quinn::ConnectionError::ApplicationClosed(frame) = error else {
+        return SessionExit::RetryFresh(detail);
+    };
+    match u32::try_from(u64::from(frame.error_code)) {
+        // The credential itself is the problem — rejected, from an
+        // incompatible build, tied to a process that is gone, or evicted from
+        // the server's token table. Redialing with it can only fail again.
+        Ok(
+            REMOTE_QUIC_CLOSE_AUTH
+            | REMOTE_QUIC_CLOSE_PROTOCOL
+            | REMOTE_QUIC_CLOSE_SHUTDOWN
+            | REMOTE_QUIC_CLOSE_EVICTED,
+        ) => SessionExit::Rebootstrap(detail),
+        // Another client took the session over. Reconnecting would fence it
+        // and invite it to fence us back, forever, so this one stops.
+        Ok(REMOTE_QUIC_CLOSE_REPLACED) => SessionExit::Superseded(detail),
+        // HANDOFF and RESYNC both want the credential we hold, and so does
+        // any code a newer server invents: a redial is the cheap guess.
+        _ => SessionExit::RetryFresh(detail),
+    }
+}
+
+/// Classifies a reader-observed close, which arrives as a formatted string
+/// rather than a `ConnectionError`.
+///
+/// The control and unidirectional readers race `Connection::closed` in the
+/// session select. Whoever wins, the outcome must be the same, so the reader
+/// branches ask the connection for the real reason instead of trusting their
+/// stringified stream error. `close_reason` is `None` only while the
+/// connection is still live — a stream that failed on its own — which is a
+/// plain retry.
+fn classify_reader_close(connection: &Connection, detail: String) -> SessionExit {
+    match connection.close_reason() {
+        Some(error) => classify_close(&error),
+        None => SessionExit::RetryFresh(detail),
     }
 }
 
@@ -1083,11 +1310,15 @@ fn client_config(fingerprint: [u8; REMOTE_QUIC_HASH_BYTES]) -> Result<quinn::Cli
     let mut transport = quinn::TransportConfig::default();
     transport
         .max_idle_timeout(Some(
-            Duration::from_secs(7 * 24 * 60 * 60)
+            CLIENT_MAX_IDLE_TIMEOUT
                 .try_into()
                 .map_err(|_| "QUIC idle timeout is too large".to_owned())?,
         ))
-        .keep_alive_interval(Some(Duration::from_secs(15)))
+        // No `keep_alive_interval`: the application already probes every
+        // HEARTBEAT_INTERVAL on the control stream and judges the answers, so
+        // a quinn PING timer would be a second, dumber liveness mechanism —
+        // it keeps a dead connection nominally alive without telling anyone,
+        // and its traffic is exactly what our probes already provide.
         .max_concurrent_bidi_streams(VarInt::from_u32(0))
         .max_concurrent_uni_streams(VarInt::from_u32(4))
         .stream_receive_window(VarInt::from_u32(CLIENT_STREAM_RECEIVE_WINDOW))
@@ -1257,9 +1488,9 @@ mod tests {
         let sent = Instant::now();
         let mut monitor = PathMonitor::new(sent);
         monitor.on_probe_sent(sent);
-        let stale_at = sent + PATH_STALE_AFTER;
+        let stale_at = sent + FAST_PROBE_AFTER;
         let _ = monitor.on_tick(stale_at);
-        assert!(monitor.stale_since.is_some());
+        assert!(monitor.fast_probe_since.is_some());
 
         let just_stale = stale_at + (FAST_PROBE_WINDOW - Duration::from_millis(1));
         assert_eq!(monitor.wake_at(just_stale), stale_at + FAST_PROBE_INTERVAL);
@@ -1298,36 +1529,40 @@ mod tests {
             .maybe_input_probe(now + Duration::from_millis(100))
             .is_none());
 
-        // 2. Advance to PATH_STALE_AFTER (1s): announces recovering, but not yet corroborated
-        let t1 = now + PATH_STALE_AFTER;
+        // 2. Advance to FAST_PROBE_AFTER (1s): probing speeds up, but nothing
+        // the user can see happens yet — one late pong is not an outage.
+        let t1 = now + FAST_PROBE_AFTER;
         let tick = monitor.on_tick(t1);
         assert_eq!(
             tick,
             TickOutcome::Probe {
                 message: ClientMessage::RemotePing { nonce: 2 },
-                announce_recovering: true,
+                announce_recovering: false,
                 needs_rebind: false,
             }
         );
+        assert!(monitor.fast_probe_since.is_some());
         assert!(!monitor.is_stale_corroborated());
 
-        // 3. Advance to STALE_CORROBORATED_AFTER (2s): corroborated dead
+        // 3. Advance to STALE_CORROBORATED_AFTER (2s) with two probes already
+        // unanswered: the path is presumed dead and announced exactly once.
         let t2 = now + STALE_CORROBORATED_AFTER;
         let tick = monitor.on_tick(t2);
         assert_eq!(
             tick,
             TickOutcome::Probe {
                 message: ClientMessage::RemotePing { nonce: 3 },
-                announce_recovering: false,
+                announce_recovering: true,
                 needs_rebind: false,
             }
         );
         assert!(monitor.is_stale_corroborated());
 
-        // While corroborated, ephemeral input is dropped, geometry is deferred, detach is returned
+        // Presumed dead but still connected: keystrokes go out on the reliable
+        // control stream, geometry is coalesced, detach is handed back.
         assert_eq!(
             monitor.filter_input(ClientMessage::Input { data: vec![b'x'] }),
-            FilteredInput::Absorbed
+            FilteredInput::Deliver(ClientMessage::Input { data: vec![b'x'] })
         );
         assert_eq!(monitor.filter_input(resize(120)), FilteredInput::Absorbed);
         assert_eq!(
@@ -1335,30 +1570,43 @@ mod tests {
             FilteredInput::Detach(ClientMessage::Detach)
         );
 
-        // 4. Advance to REBIND_AFTER (10s): requests socket rebind once
-        let t10 = now + REBIND_AFTER;
-        let tick = monitor.on_tick(t10);
+        // A second announcement must not fire while the path stays dead, or
+        // the status line thrashes for the whole outage.
+        let tick = monitor.on_tick(t2 + FAST_PROBE_INTERVAL);
         assert_eq!(
             tick,
             TickOutcome::Probe {
                 message: ClientMessage::RemotePing { nonce: 4 },
                 announce_recovering: false,
-                needs_rebind: true,
+                needs_rebind: false,
             }
         );
-        // Next tick after rebind does not request rebind again
-        let t11 = t10 + Duration::from_secs(1);
-        let tick = monitor.on_tick(t11);
+
+        // 4. Advance to REBIND_AFTER (10s): requests a socket rebind
+        let t10 = now + REBIND_AFTER;
+        let tick = monitor.on_tick(t10);
         assert_eq!(
             tick,
             TickOutcome::Probe {
                 message: ClientMessage::RemotePing { nonce: 5 },
                 announce_recovering: false,
+                needs_rebind: true,
+            }
+        );
+        // Rebinding again immediately would only discard congestion state.
+        let t11 = t10 + Duration::from_secs(1);
+        let tick = monitor.on_tick(t11);
+        assert_eq!(
+            tick,
+            TickOutcome::Probe {
+                message: ClientMessage::RemotePing { nonce: 6 },
+                announce_recovering: false,
                 needs_rebind: false,
             }
         );
 
-        // 5. Pong arrives! Path recovers and replays deferred geometry
+        // 5. Pong arrives! Path recovers and replays the coalesced geometry.
+        // The keystroke is not in the replay: it was delivered when typed.
         let pong = monitor.on_pong();
         assert_eq!(
             pong,
@@ -1385,7 +1633,8 @@ mod tests {
     fn stale_path_policy_separates_input_from_connection_state() {
         assert_eq!(
             stale_policy(&ClientMessage::Input { data: vec![b'y'] }),
-            StalePolicy::DropEphemeral
+            StalePolicy::DeliverEphemeral,
+            "a live control stream can still carry keystrokes in order"
         );
         assert_eq!(
             stale_policy(&ClientMessage::Detach),
@@ -1404,6 +1653,212 @@ mod tests {
         );
     }
 
+    /// Presumed-dead is a rendering statement, not an input statement: as long
+    /// as the connection exists, QUIC's reliable ordered control stream
+    /// delivers typing exactly as the SSH bridge did. Dropping it here cost
+    /// the user keystrokes on any link slow enough to starve a pong.
+    #[test]
+    fn ephemeral_input_is_delivered_while_the_path_is_presumed_dead() {
+        let now = Instant::now();
+        let mut monitor = PathMonitor::new(now);
+        monitor.on_probe_sent(now);
+        monitor.on_probe_sent(now + FAST_PROBE_INTERVAL);
+        let _ = monitor.on_tick(now + STALE_CORROBORATED_AFTER);
+        assert!(monitor.is_stale_corroborated());
+
+        for input in [
+            ClientMessage::Input {
+                data: b"git commit\r".to_vec(),
+            },
+            ClientMessage::InputEvents { events: Vec::new() },
+            ClientMessage::AttachScroll {
+                source: crate::protocol::AttachScrollSource::Wheel,
+                direction: crate::protocol::AttachScrollDirection::Up,
+                lines: 3,
+                column: Some(4),
+                row: Some(9),
+                modifiers: 0,
+            },
+            ClientMessage::ClipboardImage {
+                extension: "png".to_owned(),
+                data: vec![0u8; 8],
+            },
+        ] {
+            assert_eq!(
+                monitor.filter_input(input.clone()),
+                FilteredInput::Deliver(input.clone()),
+                "{input:?} must keep flowing while the connection is alive"
+            );
+        }
+
+        // Nothing was withheld, so recovery replays only coalesced state.
+        assert_eq!(monitor.on_pong(), PongOutcome::Recovered { replay: vec![] });
+    }
+
+    /// A timer that fires late — a stalled runtime, a laptop resuming from
+    /// sleep — can make a single outstanding probe look ancient before the
+    /// peer has had one round trip in which to answer. Announcing on that
+    /// evidence repaints the UI for a path that is fine.
+    #[test]
+    fn one_unanswered_probe_never_announces_however_old_it_looks() {
+        let sent = Instant::now();
+        let mut monitor = PathMonitor::new(sent);
+        monitor.on_probe_sent(sent);
+
+        let long_after = sent + STALE_CORROBORATED_AFTER * 10;
+        let tick = monitor.on_tick(long_after);
+        assert_eq!(
+            tick,
+            TickOutcome::Probe {
+                message: ClientMessage::RemotePing { nonce: 1 },
+                announce_recovering: false,
+                needs_rebind: true,
+            },
+            "one probe is not evidence of an outage, however stale it looks"
+        );
+        assert!(!monitor.is_stale_corroborated());
+
+        // The probe this tick sent is the second one, so the next round has
+        // the two independent failures the announcement requires.
+        let next = long_after + FAST_PROBE_INTERVAL;
+        let tick = monitor.on_tick(next);
+        assert_eq!(
+            tick,
+            TickOutcome::Probe {
+                message: ClientMessage::RemotePing { nonce: 2 },
+                announce_recovering: true,
+                needs_rebind: false,
+            }
+        );
+        assert!(monitor.is_stale_corroborated());
+    }
+
+    /// A single sleep -> tether -> wifi sequence changes the local address more
+    /// than once inside one outage, and only the rebind that follows the last
+    /// change can revive the connection.
+    #[test]
+    fn rebind_is_re_armed_every_interval_of_continued_silence() {
+        let sent = Instant::now();
+        let mut monitor = PathMonitor::new(sent);
+        monitor.on_probe_sent(sent);
+
+        let mut rebinds = Vec::new();
+        let mut elapsed = Duration::ZERO;
+        // Walk the whole outage at the fast cadence, which is the shortest
+        // tick spacing and so the strictest test of the re-arm window.
+        while elapsed < PATH_LOST_AFTER {
+            elapsed += FAST_PROBE_INTERVAL;
+            match monitor.on_tick(sent + elapsed) {
+                TickOutcome::Probe {
+                    needs_rebind: true, ..
+                } => rebinds.push(elapsed),
+                TickOutcome::Probe { .. } => {}
+                TickOutcome::Lost { .. } => break,
+            }
+        }
+        assert_eq!(
+            rebinds,
+            vec![
+                REBIND_AFTER,
+                REBIND_AFTER * 2,
+                REBIND_AFTER * 3,
+                REBIND_AFTER * 4,
+                REBIND_AFTER * 5,
+                REBIND_AFTER * 6,
+                REBIND_AFTER * 7,
+                REBIND_AFTER * 8,
+                REBIND_AFTER * 9,
+                REBIND_AFTER * 10,
+                REBIND_AFTER * 11,
+            ],
+            "rebind must re-arm every REBIND_AFTER of silence up to PATH_LOST_AFTER"
+        );
+
+        // A pong disarms it: the next outage starts its own schedule.
+        let mut monitor = PathMonitor::new(sent);
+        monitor.on_probe_sent(sent);
+        let first = sent + REBIND_AFTER;
+        assert!(matches!(
+            monitor.on_tick(first),
+            TickOutcome::Probe {
+                needs_rebind: true,
+                ..
+            }
+        ));
+        let _ = monitor.on_pong();
+        monitor.on_probe_sent(first);
+        assert!(
+            matches!(
+                monitor.on_tick(first + FAST_PROBE_INTERVAL),
+                TickOutcome::Probe {
+                    needs_rebind: false,
+                    ..
+                }
+            ),
+            "a recovered path must not inherit the previous outage's rebind clock"
+        );
+    }
+
+    /// The reason string is a diagnostic the server may reword at will, so the
+    /// classification hangs off the numeric close code. Every code the server
+    /// can send is pinned here: getting this wrong either loops the client
+    /// through a doomed reconnect or throws away a still-valid credential and
+    /// an SSH round trip.
+    #[test]
+    fn close_classification_follows_the_application_code_not_the_reason() {
+        use super::super::quic_policy::{REMOTE_QUIC_CLOSE_HANDOFF, REMOTE_QUIC_CLOSE_RESYNC};
+
+        let closed = |code: u32, reason: &'static str| {
+            quinn::ConnectionError::ApplicationClosed(quinn::ApplicationClose {
+                error_code: VarInt::from_u32(code),
+                reason: bytes::Bytes::from_static(reason.as_bytes()),
+            })
+        };
+
+        for code in [REMOTE_QUIC_CLOSE_HANDOFF, REMOTE_QUIC_CLOSE_RESYNC, 0xdead] {
+            assert!(
+                matches!(
+                    classify_close(&closed(code, "capability protocol server instance")),
+                    SessionExit::RetryFresh(_)
+                ),
+                "code {code:#x} must reconnect with the credential we hold, whatever the reason says"
+            );
+        }
+
+        for code in [
+            REMOTE_QUIC_CLOSE_AUTH,
+            REMOTE_QUIC_CLOSE_PROTOCOL,
+            REMOTE_QUIC_CLOSE_SHUTDOWN,
+            REMOTE_QUIC_CLOSE_EVICTED,
+        ] {
+            assert!(
+                matches!(
+                    classify_close(&closed(code, "nothing quotable here")),
+                    SessionExit::Rebootstrap(_)
+                ),
+                "code {code:#x} invalidates the credential and must re-bootstrap"
+            );
+        }
+
+        // Two clients that both redial on REPLACED fence each other forever:
+        // each reconnect makes a newer generation that evicts the other.
+        assert!(
+            matches!(
+                classify_close(&closed(REMOTE_QUIC_CLOSE_REPLACED, "replaced")),
+                SessionExit::Superseded(_)
+            ),
+            "a superseded generation must stop, not race the client that took over"
+        );
+
+        assert!(
+            matches!(
+                classify_close(&quinn::ConnectionError::TimedOut),
+                SessionExit::RetryFresh(_)
+            ),
+            "a transport timeout says nothing about the credential"
+        );
+    }
+
     fn resize(cols: u16) -> ClientMessage {
         ClientMessage::Resize {
             cols,
@@ -1416,25 +1871,27 @@ mod tests {
     #[test]
     fn deferred_resize_keeps_only_the_newest_geometry() {
         let mut deferred = DeferredState::default();
-        assert!(deferred.hold(resize(80)).is_none());
-        assert!(deferred.hold(resize(120)).is_none());
+        assert_eq!(deferred.hold(resize(80)), FilteredInput::Absorbed);
+        assert_eq!(deferred.hold(resize(120)), FilteredInput::Absorbed);
         assert_eq!(deferred.replay().collect::<Vec<_>>(), vec![resize(120)]);
     }
 
     #[test]
     fn deferred_terminal_mode_replaces_across_variants() {
         let mut deferred = DeferredState::default();
-        assert!(deferred
-            .hold(ClientMessage::ObserveTerminal {
+        assert_eq!(
+            deferred.hold(ClientMessage::ObserveTerminal {
                 target: "pane-1".to_owned(),
-            })
-            .is_none());
-        assert!(deferred
-            .hold(ClientMessage::ControlTerminal {
+            }),
+            FilteredInput::Absorbed
+        );
+        assert_eq!(
+            deferred.hold(ClientMessage::ControlTerminal {
                 target: "pane-1".to_owned(),
                 takeover: true,
-            })
-            .is_none());
+            }),
+            FilteredInput::Absorbed
+        );
         // Replaying the observe first would be rejected as an illegal upgrade
         // and would disconnect the client, so only the newest survives.
         assert_eq!(
@@ -1449,13 +1906,14 @@ mod tests {
     #[test]
     fn deferred_replay_sends_mode_before_geometry() {
         let mut deferred = DeferredState::default();
-        assert!(deferred.hold(resize(100)).is_none());
-        assert!(deferred
-            .hold(ClientMessage::AttachTerminal {
+        assert_eq!(deferred.hold(resize(100)), FilteredInput::Absorbed);
+        assert_eq!(
+            deferred.hold(ClientMessage::AttachTerminal {
                 terminal_id: "t1".to_owned(),
                 takeover: false,
-            })
-            .is_none());
+            }),
+            FilteredInput::Absorbed
+        );
         let replayed = deferred.replay().collect::<Vec<_>>();
         assert!(
             matches!(replayed.first(), Some(ClientMessage::AttachTerminal { .. })),
@@ -1466,9 +1924,9 @@ mod tests {
     }
 
     #[test]
-    fn ephemeral_input_is_dropped_while_deferred_state_survives() {
+    fn ephemeral_input_passes_through_while_deferred_state_accumulates() {
         let mut deferred = DeferredState::default();
-        assert!(deferred.hold(resize(90)).is_none());
+        assert_eq!(deferred.hold(resize(90)), FilteredInput::Absorbed);
         for ephemeral in [
             ClientMessage::Input { data: vec![b'q'] },
             ClientMessage::InputEvents { events: Vec::new() },
@@ -1477,9 +1935,13 @@ mod tests {
                 data: vec![0u8; 8],
             },
         ] {
-            assert!(deferred.hold(ephemeral).is_none());
+            assert_eq!(
+                deferred.hold(ephemeral.clone()),
+                FilteredInput::Deliver(ephemeral),
+                "input is the transport's job to deliver, not this type's to hoard"
+            );
         }
-        // Keystrokes vanished; geometry did not.
+        // Only coalescable state is held back.
         assert_eq!(deferred.replay().collect::<Vec<_>>(), vec![resize(90)]);
     }
 
@@ -1488,7 +1950,7 @@ mod tests {
         let mut deferred = DeferredState::default();
         assert_eq!(
             deferred.hold(ClientMessage::Detach),
-            Some(ClientMessage::Detach),
+            FilteredInput::Detach(ClientMessage::Detach),
             "detach must be handed back so the session can exit locally"
         );
         assert!(deferred.is_empty());
@@ -1739,6 +2201,96 @@ mod tests {
             ),
             "session did not survive a saturated resource transfer"
         );
+    }
+
+    /// A live session fenced by a newer generation of its own capability must
+    /// stop, and must reach that verdict whichever select arm observes the
+    /// close first.
+    ///
+    /// The control reader, the uni-stream acceptor, and `Connection::closed`
+    /// all wake on the same close and race into the same `select!`. The
+    /// readers only carry a formatted string, so unless every one of them
+    /// consults the connection's close code, the session's exit is decided by
+    /// a scheduler coin flip: here, between stopping and immediately redialing
+    /// to fence the client that just took over.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_superseded_generation_stops_whichever_reader_sees_the_close() {
+        let probe = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind port probe");
+        let port = probe.local_addr().expect("probe address").port();
+        drop(probe);
+        let config = crate::config::RemoteConfig {
+            quic_port_range: format!("{port}-{port}"),
+            ..Default::default()
+        };
+        let (server_event_tx, mut server_event_rx) = mpsc::channel(16);
+        let server = crate::server::remote_quic::RemoteQuicServer::start(&config, server_event_tx)
+            .expect("start QUIC server");
+        let logical_client_id = [31; crate::protocol::REMOTE_QUIC_ID_BYTES];
+        let bootstrap = server
+            .bootstrap(crate::protocol::RemoteBootstrapRequest {
+                session: crate::session::active_name()
+                    .unwrap_or_else(|| crate::session::DEFAULT_SESSION_NAME.to_owned()),
+                logical_client_id,
+            })
+            .expect("bootstrap QUIC client");
+        // Same capability, later generation: exactly what a second local proxy
+        // attaching to this session does.
+        let dial = |connection_generation: u64| {
+            let bootstrap = bootstrap.clone();
+            async move {
+                QuicSession::connect(
+                    ConnectParams {
+                        bootstrap,
+                        candidates: vec![SocketAddr::from((Ipv4Addr::LOCALHOST, port))],
+                        logical_client_id,
+                        connection_generation,
+                        cols: 80,
+                        rows: 24,
+                        cell_width_px: 8,
+                        cell_height_px: 16,
+                        keybindings: ClientKeybindings::Server,
+                    },
+                    Arc::new(Mutex::new(ResourceCache::default())),
+                )
+                .await
+                .expect("connect QUIC client")
+                .0
+            }
+        };
+
+        let first = dial(1).await;
+        let (_input_tx, input_rx) = mpsc::channel(4);
+        let (output_tx, _output_rx) = mpsc::channel(16);
+        let session_task = tokio::spawn(first.run(input_rx, output_tx, false));
+
+        let second = dial(2).await;
+        let exit = tokio::time::timeout(Duration::from_secs(5), session_task)
+            .await
+            .expect("superseded session never exited")
+            .expect("session task");
+        assert!(
+            matches!(exit, SessionExit::Superseded(_)),
+            "a fenced generation must not redial and fence the client that replaced it: {exit:?}"
+        );
+
+        // The same close observed through a reader event rather than the
+        // `closed()` arm: the string says nothing, so the branch has to ask the
+        // connection.
+        let fenced = second.connection.clone();
+        let _third = dial(3).await;
+        let closed = tokio::time::timeout(Duration::from_secs(5), fenced.closed())
+            .await
+            .expect("second generation was never fenced");
+        assert!(
+            matches!(
+                classify_reader_close(&fenced, "remote control reader stopped".to_owned()),
+                SessionExit::Superseded(_)
+            ),
+            "reader-observed close must be classified by the connection's code, not its text: \
+             {closed}"
+        );
+
+        while server_event_rx.try_recv().is_ok() {}
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2201,23 +2753,42 @@ mod tests {
         .await
         .expect("path recovery status timeout");
         assert_eq!(status, RemoteTransportStatus::PathRecovering);
-        // Hold the outage past STALE_CORROBORATED_AFTER before restoring.
-        // PathRecovering is announced at PATH_STALE_AFTER, but the full-redraw
-        // request is deliberately gated on corroborated staleness: a stall
-        // shorter than that is recovered by the reliable stream's own
-        // retransmissions, in order, with nothing dropped and so nothing to
-        // resync. Only a corroborated outage drops input and therefore needs a
-        // fresh generation.
+        // Hold the outage past STALE_CORROBORATED_AFTER before restoring. The
+        // full-redraw request is deliberately gated on that threshold: a
+        // shorter stall is recovered by the reliable stream's own
+        // retransmissions, in order, with nothing lost and so nothing to
+        // resync. Only a presumed-dead path coalesces state and needs a fresh
+        // generation built against it.
         tokio::time::sleep(STALE_CORROBORATED_AFTER + Duration::from_millis(500)).await;
+        // Typing into a presumed-dead path must still reach the server. The
+        // control stream is reliable and ordered, so quinn retransmits this
+        // keystroke when the path returns — the exact guarantee the SSH bridge
+        // gave, and the one dropping input here used to break.
+        input_tx
+            .send(ClientMessage::Input {
+                data: b"typed-in-the-dark".to_vec(),
+            })
+            .await
+            .expect("send input while the path is presumed dead");
         mode_tx.send(NetworkMode::Online).expect("restore network");
 
+        let mut saw_typed_input = false;
+        let mut saw_sync_request = false;
         tokio::time::timeout(Duration::from_secs(8), async {
-            loop {
+            while !saw_typed_input || !saw_sync_request {
                 match server_event_rx.recv().await {
+                    Some(crate::server::client_transport::ServerEvent::ClientInput {
+                        data,
+                        ..
+                    }) => {
+                        if data == b"typed-in-the-dark" {
+                            saw_typed_input = true;
+                        }
+                    }
                     Some(crate::server::client_transport::ServerEvent::ClientSyncRequest {
                         ..
                     }) => {
-                        break;
+                        saw_sync_request = true;
                     }
                     Some(_) => {}
                     None => panic!("server event channel closed"),
@@ -2225,7 +2796,7 @@ mod tests {
             }
         })
         .await
-        .expect("full redraw request timeout");
+        .expect("input written while dark, and the full redraw request, must both arrive");
         let canonical_frame = concat!(
             "\x1b[?1049h\x1b[?2026h\x1b[2J\x1b[H",
             "plain e\u{301} 界 👩‍💻\r\n",

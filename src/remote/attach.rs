@@ -1831,9 +1831,15 @@ pub(super) fn request_remote_quic_bootstrap(
 
 #[cfg(unix)]
 pub(super) fn remote_quic_candidates(hostname: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
-    let mut candidates = (hostname, port).to_socket_addrs()?.collect::<Vec<_>>();
+    let mut seen = std::collections::HashSet::new();
+    // IPv6 first, then IPv4: the proxy dials the list in order with a small
+    // stagger, so this is the preference order for a tie. Duplicates are
+    // dropped outright because a repeated address would waste a parallel dial.
+    let mut candidates = (hostname, port)
+        .to_socket_addrs()?
+        .filter(|candidate| seen.insert(*candidate))
+        .collect::<Vec<_>>();
     candidates.sort_by_key(|candidate| if candidate.is_ipv6() { 0 } else { 1 });
-    candidates.dedup();
     if candidates.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::AddrNotAvailable,
@@ -2380,6 +2386,170 @@ mod tests {
 
         drop(bridge);
         let _ = std::fs::remove_file(socket);
+    }
+
+    /// The first attach must not wait out the QUIC deadline on a host that
+    /// silently drops UDP: the SSH bridge races QUIC after a short head start
+    /// and its welcome reaches the local client well before QUIC gives up.
+    #[cfg(unix)]
+    #[test]
+    fn ssh_bridge_race_beats_a_black_holed_quic_endpoint() {
+        use std::os::unix::fs::PermissionsExt;
+
+        struct RestorePath(Option<std::ffi::OsString>);
+        impl Drop for RestorePath {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    // SAFETY: nextest runs one test per process, so no other
+                    // thread of this test binary is reading the environment.
+                    Some(path) => unsafe { std::env::set_var("PATH", path) },
+                    None => unsafe { std::env::remove_var("PATH") },
+                }
+            }
+        }
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|since| since.as_nanos())
+            .unwrap_or_default();
+        let dir =
+            std::env::temp_dir().join(format!("herdr-ssh-race-{}-{unique}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+
+        // The fake ssh bridge replays a pre-encoded welcome, then idles long
+        // enough for the assertions below.
+        let mut welcome = Vec::new();
+        crate::protocol::write_message(
+            &mut welcome,
+            &crate::protocol::ServerMessage::Welcome {
+                version: crate::protocol::PROTOCOL_VERSION,
+                encoding: crate::protocol::RenderEncoding::TerminalAnsi,
+                error: None,
+            },
+        )
+        .expect("encode welcome");
+        let welcome_path = dir.join("welcome.bin");
+        std::fs::write(&welcome_path, &welcome).expect("write welcome");
+        let fake_ssh = dir.join("ssh");
+        std::fs::write(
+            &fake_ssh,
+            "#!/bin/sh\ncat \"$HERDR_TEST_SSH_WELCOME\"\nexec sleep 1\n",
+        )
+        .expect("write fake ssh");
+        let mut permissions = std::fs::metadata(&fake_ssh)
+            .expect("fake ssh metadata")
+            .permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&fake_ssh, permissions).expect("fake ssh executable");
+
+        let restore = RestorePath(std::env::var_os("PATH"));
+        let test_path = match restore.0.as_ref() {
+            Some(path) => {
+                let mut paths = vec![dir.clone()];
+                paths.extend(std::env::split_paths(path));
+                std::env::join_paths(paths).expect("test PATH")
+            }
+            None => dir.clone().into_os_string(),
+        };
+        // SAFETY: see RestorePath above.
+        unsafe {
+            std::env::set_var("PATH", test_path);
+            std::env::set_var("HERDR_TEST_SSH_WELCOME", &welcome_path);
+        }
+
+        // Bound but never read: a QUIC handshake against it can only time out.
+        let black_hole = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind black hole");
+        let quic_port = black_hole.local_addr().expect("black hole addr").port();
+
+        let socket = dir.join("bridge.sock");
+        let bridge = crate::remote::proxy::ResumableRemoteBridge::start(
+            crate::remote::proxy::BridgeConfig {
+                target: "example".to_owned(),
+                remote_herdr: RemoteHerdr::for_platform(RemotePlatform {
+                    os: "linux",
+                    arch: "x86_64",
+                }),
+                local_socket: socket.clone(),
+                session_name: "default".to_owned(),
+                ssh_options: None,
+                remote_config: crate::config::RemoteConfig {
+                    transport: crate::config::RemoteTransportConfig::Auto,
+                    ssh_fallback: true,
+                    ..Default::default()
+                },
+                logical_client_id: [0; crate::protocol::REMOTE_QUIC_ID_BYTES],
+                ssh_hostname: Some("127.0.0.1".to_owned()),
+                bootstrap: Some(crate::protocol::RemoteBootstrapRecord {
+                    version: crate::protocol::PROTOCOL_VERSION,
+                    server_instance_id: [5; crate::protocol::REMOTE_QUIC_ID_BYTES],
+                    port: quic_port,
+                    certificate_fingerprint: [6; crate::protocol::REMOTE_QUIC_HASH_BYTES],
+                    capability_token: [7; crate::protocol::REMOTE_QUIC_TOKEN_BYTES],
+                    expires_unix_seconds: u64::MAX,
+                    ssh_fallback_available: true,
+                }),
+                bootstrap_error: None,
+            },
+        )
+        .expect("start bridge listener");
+
+        let mut client = UnixStream::connect(&socket).expect("connect local client");
+        client
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("read timeout");
+        crate::protocol::write_message(
+            &mut client,
+            &crate::protocol::ClientMessage::Hello {
+                version: crate::protocol::PROTOCOL_VERSION,
+                cols: 80,
+                rows: 24,
+                cell_width_px: 8,
+                cell_height_px: 16,
+                requested_encoding: crate::protocol::RenderEncoding::TerminalAnsi,
+                keybindings: crate::protocol::ClientKeybindings::Server,
+                launch_mode: crate::protocol::ClientLaunchMode::App,
+            },
+        )
+        .expect("send client hello");
+
+        let started = Instant::now();
+        let first: crate::protocol::ServerMessage =
+            crate::protocol::read_message(&mut client, crate::protocol::MAX_FRAME_SIZE)
+                .expect("bridge welcome");
+        let elapsed = started.elapsed();
+        assert!(
+            matches!(
+                first,
+                crate::protocol::ServerMessage::Welcome { error: None, .. }
+            ),
+            "expected a welcome, got {first:?}"
+        );
+        // The old sequential path could only answer after the whole QUIC
+        // connect budget had expired.
+        assert!(
+            elapsed < Duration::from_millis(1_200),
+            "SSH bridge welcome took {elapsed:?}"
+        );
+        let status: crate::protocol::ServerMessage =
+            crate::protocol::read_message(&mut client, crate::protocol::MAX_FRAME_SIZE)
+                .expect("transport status");
+        assert!(
+            matches!(
+                status,
+                crate::protocol::ServerMessage::TransportStatus {
+                    status: crate::protocol::RemoteTransportStatus::Connected,
+                    ..
+                }
+            ),
+            "expected Connected, got {status:?}"
+        );
+
+        let _ =
+            crate::protocol::write_message(&mut client, &crate::protocol::ClientMessage::Detach);
+        drop(client);
+        drop(bridge);
+        drop(restore);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(windows)]

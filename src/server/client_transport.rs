@@ -69,13 +69,29 @@ impl ClientWriter {
         }
     }
 
+    /// True when this writer talks to a remote QUIC client. Handoff must not
+    /// send those clients `ServerShutdown`: they keep their capability and
+    /// reconnect to the restarted server instead.
+    #[cfg(unix)]
+    pub(crate) fn is_quic(&self) -> bool {
+        match &self.control.target {
+            ClientControlTarget::Queue(_) => false,
+            ClientControlTarget::Quic(_) => true,
+        }
+    }
+
     pub(crate) fn replace_with_cleanup(&self, data: Vec<u8>) {
         match &self.render.target {
             ClientRenderTarget::Queue(queue) => queue.replace_with_cleanup(data),
             #[cfg(unix)]
             ClientRenderTarget::Quic(_) => {
                 self.render.reset_generation();
-                let _ = self.control.send(data);
+                // A rejected cleanup frame leaves the client showing stale
+                // graphics, so the QUIC sender closes the connection and the
+                // client resyncs on a fresh one; nothing to recover here.
+                if self.control.send(data).is_err() {
+                    warn!("dropped remote graphics cleanup: control channel closed");
+                }
             }
             // Bypasses the queue like every other `Channel` send, so cleanup is
             // not ordered against control writes. Tests that care about that
@@ -129,6 +145,22 @@ impl ClientWriter {
             drain.close_writer();
         });
         writer
+    }
+
+    /// A writer over a real QUIC sender pair, for tests that need
+    /// [`ClientWriter::is_quic`] to be true. The returned receivers keep the
+    /// render channel and control queue alive; drop them to simulate a
+    /// departed remote client.
+    #[cfg(all(test, unix))]
+    pub(crate) fn test_quic() -> (
+        Self,
+        std::sync::Arc<crate::server::remote_quic::BoundedControlQueue>,
+        mpsc::UnboundedReceiver<crate::protocol::TerminalFrame>,
+    ) {
+        let (control, queue) = crate::server::remote_quic::QuicControlSender::new();
+        let (render, render_rx, _generation_rx) =
+            crate::server::remote_quic::QuicRenderSender::new();
+        (Self::quic(control, render), queue, render_rx)
     }
 
     /// A writer over the production `ClientWriterQueue`, with no test

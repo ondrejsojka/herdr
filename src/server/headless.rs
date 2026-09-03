@@ -295,6 +295,11 @@ pub struct HeadlessServer {
     client_listener: LocalListener,
     #[cfg(unix)]
     remote_quic: Option<crate::server::remote_quic::RemoteQuicServer>,
+    /// `[remote]` config captured when the server started. QUIC bootstrap
+    /// requests arrive on the event loop, so reading the config file there
+    /// would stall rendering for every connected client.
+    #[cfg(unix)]
+    remote_config: crate::config::RemoteConfig,
     client_socket_path: PathBuf,
     client_socket_identity: SocketFileIdentity,
     clients: HashMap<u64, ClientConnection>,
@@ -485,6 +490,7 @@ impl HeadlessServer {
     pub fn new(
         app: app::App,
         config_diagnostics: &[String],
+        remote_config: crate::config::RemoteConfig,
         api_tx: Option<api::ApiRequestSender>,
         api_server: Option<api::ServerHandle>,
         should_quit: Arc<AtomicBool>,
@@ -511,7 +517,7 @@ impl HeadlessServer {
         let (server_config_diagnostic, server_config_diagnostic_without_keybindings) =
             server_config_diagnostic_summaries(config_diagnostics);
         #[cfg(not(unix))]
-        let _ = api_tx;
+        let _ = (api_tx, remote_config);
         Ok(Self {
             app,
             #[cfg(unix)]
@@ -521,6 +527,8 @@ impl HeadlessServer {
             client_listener: listener,
             #[cfg(unix)]
             remote_quic: None,
+            #[cfg(unix)]
+            remote_config,
             client_socket_path: client_path,
             client_socket_identity,
             clients: HashMap::new(),
@@ -1284,8 +1292,37 @@ impl HeadlessServer {
             ));
         }
 
+        // Exported before any client is disconnected so the successor inherits
+        // the UDP sockets, certificate, instance id, and live capabilities.
+        // Remote clients then reconnect with the token they already hold
+        // instead of running a fresh SSH bootstrap.
+        let (remote_quic_state, remote_quic_fds) = match self.remote_quic.as_ref() {
+            Some(server) => match server.export_handoff() {
+                Ok((state, fds))
+                    if pane_by_terminal.len() + fds.len()
+                        <= crate::server::handoff::MAX_FDS_PER_HANDOFF =>
+                {
+                    (Some(state), fds)
+                }
+                Ok((_, fds)) => {
+                    warn!(
+                        panes = pane_by_terminal.len(),
+                        quic_fds = fds.len(),
+                        "no room left in the handoff for the QUIC sockets; remote clients will re-bootstrap"
+                    );
+                    (None, Vec::new())
+                }
+                Err(err) => {
+                    warn!(err = %err, "failed to export QUIC handoff state; remote clients will re-bootstrap");
+                    (None, Vec::new())
+                }
+            },
+            None => (None, Vec::new()),
+        };
+        let quic_clients_can_resume = remote_quic_state.is_some();
+
         self.handoff_in_progress = true;
-        self.disconnect_all_clients_for_handoff();
+        self.disconnect_all_clients_for_handoff(quic_clients_can_resume);
         let _ = reject_pending_client_connections(&self.client_listener);
 
         let mut paused_terminal_ids = Vec::new();
@@ -1338,6 +1375,7 @@ impl HeadlessServer {
             params.expected_protocol,
             params.expected_version,
             self.api_window_title.clone(),
+            remote_quic_state,
         );
         let mut import_child = match crate::server::handoff::spawn_handoff_import(
             import_exe.as_deref(),
@@ -1363,6 +1401,11 @@ impl HeadlessServer {
             }
             Ok::<(), io::Error>(())
         })();
+        // The QUIC sockets ride after the pane fds; the importer splits them
+        // back apart with `HandoffManifest::remote_quic_fd_count`.
+        for socket in remote_quic_fds {
+            fds.push(std::os::fd::IntoRawFd::into_raw_fd(socket));
+        }
         if let Err(err) = duplicate_result {
             for fd in fds {
                 let _ = unsafe { libc::close(fd) };
@@ -1421,6 +1464,14 @@ impl HeadlessServer {
             return Err(io::Error::other(format!(
                 "handoff replacement server did not become ready: {err}"
             )));
+        }
+        // The successor holds the inherited UDP sockets but binds its endpoints
+        // only after the commit, so releasing ours first keeps two processes
+        // from reading one socket. Connected clients see a handoff close and
+        // reconnect with the capability they already hold.
+        if let Some(server) = self.remote_quic.take() {
+            server.close_for_handoff();
+            info!("closed QUIC endpoints for handoff");
         }
         if let Err(err) = crate::server::handoff::report_committed(&mut stream) {
             crate::server::handoff::cleanup_failed_import_child(&mut import_child);
@@ -1511,6 +1562,14 @@ impl HeadlessServer {
         self.restore_public_sockets_after_failed_handoff()
     }
 
+    /// Undoes everything `perform_live_handoff` did before the commit point.
+    ///
+    /// Resumable QUIC clients were dropped from `self.clients` up front, but
+    /// their connections are still live on our own endpoint: left alone they
+    /// stay `Connected` against a client id that no longer exists, so the
+    /// screen freezes and every keystroke is discarded. The handoff close
+    /// makes each one re-dial this restored server with the capability it
+    /// still holds and come back as a fresh client.
     #[cfg(unix)]
     fn rollback_handoff_before_commit(
         &mut self,
@@ -1524,6 +1583,12 @@ impl HeadlessServer {
         }
         self.handoff_in_progress = false;
         let _ = std::fs::remove_file(socket_path);
+        if let Some(server) = self.remote_quic.as_ref() {
+            server.close_connections(
+                crate::remote::quic_policy::REMOTE_QUIC_CLOSE_HANDOFF,
+                b"handoff rolled back",
+            );
+        }
     }
 
     #[cfg(unix)]
@@ -2787,19 +2852,34 @@ impl HeadlessServer {
         }
     }
 
+    /// Drops every client so the successor server can own the sockets.
+    ///
+    /// `quic_clients_can_resume` is set when the QUIC transport state travels
+    /// with the handoff. Those clients must not be told the server shut down —
+    /// the client turns `ServerShutdown` into a full SSH re-bootstrap — so they
+    /// are dropped silently and learn about the swap from the handoff close
+    /// code, which reconnects them with the capability they already hold.
     #[cfg(unix)]
-    fn disconnect_all_clients_for_handoff(&mut self) {
+    fn disconnect_all_clients_for_handoff(&mut self, quic_clients_can_resume: bool) {
         let client_ids = self.clients.keys().copied().collect::<Vec<_>>();
         for client_id in client_ids {
-            self.send_client_graphics_cleanup(client_id);
-            self.send_to_client(
-                client_id,
-                ServerMessage::ServerShutdown {
-                    reason: Some(
-                        "live update in progress; reconnect after handoff completes".to_owned(),
-                    ),
-                },
-            );
+            let resumes_over_quic = quic_clients_can_resume
+                && self
+                    .clients
+                    .get(&client_id)
+                    .and_then(|client| client.writer.as_ref())
+                    .is_some_and(crate::server::client_transport::ClientWriter::is_quic);
+            if !resumes_over_quic {
+                self.send_client_graphics_cleanup(client_id);
+                self.send_to_client(
+                    client_id,
+                    ServerMessage::ServerShutdown {
+                        reason: Some(
+                            "live update in progress; reconnect after handoff completes".to_owned(),
+                        ),
+                    },
+                );
+            }
             if let Some(client) = self.clients.get_mut(&client_id) {
                 client.writer = None;
             }
@@ -3346,9 +3426,8 @@ impl HeadlessServer {
                     let result = if let Some(server) = self.remote_quic.as_ref() {
                         server.bootstrap(request)
                     } else {
-                        let remote_config = crate::config::Config::load().config.remote;
                         match crate::server::remote_quic::RemoteQuicServer::start(
-                            &remote_config,
+                            &self.remote_config,
                             self.server_event_tx.clone(),
                         ) {
                             Ok(server) => {
@@ -5158,6 +5237,7 @@ pub fn run_server() -> io::Result<()> {
         let mut server = match HeadlessServer::new(
             app,
             &loaded_config.diagnostics,
+            loaded_config.config.remote.clone(),
             Some(api_tx.clone()),
             Some(_api_server),
             should_quit,
@@ -5227,6 +5307,16 @@ fn run_handoff_import_server(socket_path: &Path, token: &str) -> io::Result<()> 
     let event_hub = api::EventHub::default();
     let should_quit = Arc::new(AtomicBool::new(false));
 
+    // Pane PTYs come first in the handoff fd list; the QUIC sockets follow.
+    let pane_fd_count = received.manifest.panes.len().min(received.fds.len());
+    let remote_quic_state = received.manifest.remote_quic.take();
+    let remote_quic_fds = received
+        .fds
+        .split_off(pane_fd_count)
+        .into_iter()
+        .map(|fd| unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(fd) })
+        .collect::<Vec<_>>();
+
     let mut imports = HashMap::new();
     for (pane, fd) in received.manifest.panes.into_iter().zip(received.fds) {
         let pane_id = pane.pane_id;
@@ -5272,6 +5362,7 @@ fn run_handoff_import_server(socket_path: &Path, token: &str) -> io::Result<()> 
         let mut server = HeadlessServer::new(
             app,
             &loaded_config.diagnostics,
+            loaded_config.config.remote.clone(),
             Some(api_tx.clone()),
             Some(api_server),
             should_quit,
@@ -5284,6 +5375,23 @@ fn run_handoff_import_server(socket_path: &Path, token: &str) -> io::Result<()> 
         server.app.assume_handoff_ownership();
         server.app.unpause_handoff_readers();
         server.pending_handoff_repaint_nudge = true;
+        if let Some(state) = remote_quic_state {
+            let sockets = remote_quic_fds.len();
+            match crate::server::remote_quic::RemoteQuicServer::import_handoff(
+                state,
+                remote_quic_fds,
+                &loaded_config.config.remote,
+                server.server_event_tx.clone(),
+            ) {
+                Ok(quic) => {
+                    info!(sockets, "adopted the QUIC endpoint from the handoff");
+                    server.remote_quic = Some(quic);
+                }
+                Err(err) => {
+                    warn!(err = %err, "failed to adopt the handed-off QUIC endpoint; remote clients will re-bootstrap");
+                }
+            }
+        }
         if let Err(err) = crate::server::handoff::report_owned(&mut received.stream) {
             warn!(err = %err, "failed to report handoff ownership; continuing as owner");
         }
@@ -5438,6 +5546,8 @@ mod tests {
             client_listener: listener,
             #[cfg(unix)]
             remote_quic: None,
+            #[cfg(unix)]
+            remote_config: config.remote.clone(),
             client_socket_path: socket_path,
             client_socket_identity,
             clients: HashMap::new(),
@@ -5474,6 +5584,166 @@ mod tests {
     fn read_server_message(bytes: Vec<u8>) -> ServerMessage {
         let mut cursor = std::io::Cursor::new(bytes);
         protocol::read_message(&mut cursor, MAX_FRAME_SIZE).expect("decode server message")
+    }
+
+    /// A local socket client holds no QUIC capability, so a handoff that
+    /// carries the QUIC transport across must still tell it to reconnect.
+    #[cfg(unix)]
+    #[test]
+    fn a_handoff_tells_socket_clients_to_reconnect_even_when_quic_state_travels() {
+        let mut server = test_headless_server();
+        let (client_tx, control_rx, _render_rx) = test_client_writer();
+        server.clients.insert(
+            1,
+            ClientConnection::new(
+                (80, 24),
+                crate::kitty_graphics::HostCellSize::default(),
+                crate::terminal_theme::TerminalTheme::default(),
+                None,
+                1,
+                RenderEncoding::SemanticFrame,
+                Some(client_tx),
+            ),
+        );
+
+        server.disconnect_all_clients_for_handoff(true);
+
+        assert!(
+            server.clients.is_empty(),
+            "handoff should drop every client"
+        );
+        let mut shutdown_reason = None;
+        while let Ok(bytes) = control_rx.recv_timeout(Duration::from_secs(1)) {
+            if let ServerMessage::ServerShutdown { reason } = read_server_message(bytes) {
+                shutdown_reason = reason;
+                break;
+            }
+        }
+        let reason = shutdown_reason.expect("socket client should receive ServerShutdown");
+        assert!(
+            reason.contains("live update"),
+            "handoff shutdown should name the live update: {reason}"
+        );
+    }
+
+    /// A QUIC client can reconnect with the capability it already holds, and
+    /// the client turns `ServerShutdown` into a full SSH re-bootstrap, so a
+    /// handoff that carries the transport across must stay silent.
+    #[cfg(unix)]
+    #[test]
+    fn a_handoff_that_carries_quic_state_does_not_shut_down_quic_clients() {
+        let mut server = test_headless_server();
+        let (client_tx, control_queue, _render_rx) = ClientWriter::test_quic();
+        server.clients.insert(
+            1,
+            ClientConnection::new(
+                (80, 24),
+                crate::kitty_graphics::HostCellSize::default(),
+                crate::terminal_theme::TerminalTheme::default(),
+                None,
+                1,
+                RenderEncoding::SemanticFrame,
+                Some(client_tx),
+            ),
+        );
+        assert_eq!(control_queue.bounds(), (0, 0));
+
+        server.disconnect_all_clients_for_handoff(true);
+
+        assert!(
+            server.clients.is_empty(),
+            "handoff should drop every client"
+        );
+        assert_eq!(
+            control_queue.bounds(),
+            (0, 0),
+            "a resumable QUIC client must not be sent anything on the handoff path"
+        );
+    }
+
+    /// Without the transport state the successor cannot honour existing
+    /// capabilities, so QUIC clients have to be told to re-bootstrap.
+    #[cfg(unix)]
+    #[test]
+    fn a_handoff_without_quic_state_still_shuts_down_quic_clients() {
+        let mut server = test_headless_server();
+        let (client_tx, control_queue, _render_rx) = ClientWriter::test_quic();
+        server.clients.insert(
+            1,
+            ClientConnection::new(
+                (80, 24),
+                crate::kitty_graphics::HostCellSize::default(),
+                crate::terminal_theme::TerminalTheme::default(),
+                None,
+                1,
+                RenderEncoding::SemanticFrame,
+                Some(client_tx),
+            ),
+        );
+
+        server.disconnect_all_clients_for_handoff(false);
+
+        let (items, bytes) = control_queue.bounds();
+        assert!(
+            items > 0 && bytes > 0,
+            "a QUIC client with no resumable state should be told the server is going away"
+        );
+    }
+
+    /// A handoff that fails before the commit restores this server, but the
+    /// resumable QUIC clients are already gone from `clients`: unless their
+    /// connections are closed they stay `Connected` against a client id that
+    /// no longer exists, so the screen freezes and input is dropped.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_rolled_back_handoff_closes_resumable_quic_connections() {
+        use crate::server::remote_quic::tests::{
+            connect_live_test_client, test_server_on_free_port,
+        };
+
+        let mut server = test_headless_server();
+        let (quic, mut quic_events, session) = test_server_on_free_port();
+        let client = connect_live_test_client(&quic, &session, 31).await;
+        assert!(matches!(
+            quic_events.recv().await,
+            Some(crate::server::client_transport::ServerEvent::ClientConnected { .. })
+        ));
+        server.remote_quic = Some(quic);
+
+        let (client_tx, _control_queue, _render_rx) = ClientWriter::test_quic();
+        server.clients.insert(
+            1,
+            ClientConnection::new(
+                (80, 24),
+                crate::kitty_graphics::HostCellSize::default(),
+                crate::terminal_theme::TerminalTheme::default(),
+                None,
+                1,
+                RenderEncoding::SemanticFrame,
+                Some(client_tx),
+            ),
+        );
+        server.handoff_in_progress = true;
+        server.disconnect_all_clients_for_handoff(true);
+        assert!(server.clients.is_empty());
+
+        server.rollback_handoff_before_commit(
+            &std::env::temp_dir().join("herdr-rollback-test-never-created.sock"),
+            &[],
+        );
+
+        assert!(!server.handoff_in_progress);
+        let closed = tokio::time::timeout(Duration::from_secs(5), client.connection.closed())
+            .await
+            .expect("the rolled-back handoff closes the live QUIC connection");
+        match closed {
+            quinn::ConnectionError::ApplicationClosed(frame) => assert_eq!(
+                u64::from(frame.error_code),
+                u64::from(crate::remote::quic_policy::REMOTE_QUIC_CLOSE_HANDOFF),
+                "the client must be told to reconnect with the capability it holds"
+            ),
+            other => panic!("expected an application close, got {other}"),
+        }
     }
 
     fn read_server_frame(bytes: Vec<u8>) -> FrameData {

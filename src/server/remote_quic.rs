@@ -3,14 +3,16 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
+use std::os::fd::OwnedFd;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use quinn::{Connection, Endpoint, RecvStream, SendStream, VarInt};
+use quinn::{Connection, Endpoint, SendStream, VarInt};
+use serde::{Deserialize, Serialize};
 use socket2::{Domain, Protocol, Socket, Type};
-use tokio::sync::{mpsc, watch, Notify, Semaphore};
-use tracing::{debug, info};
+use tokio::sync::{mpsc, watch, Notify, OwnedSemaphorePermit, Semaphore};
+use tracing::{debug, info, warn};
 
 use crate::config::RemoteConfig;
 use crate::protocol::{
@@ -23,6 +25,9 @@ use crate::protocol::{
 use crate::remote::frame::{hash_bytes, lock, read_async_message, write_async_message};
 use crate::remote::quic_policy::{
     MAX_RESOURCE_REFS_PER_FRAME, PRIORITY_CONTROL, PRIORITY_RENDER, PRIORITY_RESOURCE,
+    REMOTE_QUIC_CLOSE_AUTH, REMOTE_QUIC_CLOSE_EVICTED, REMOTE_QUIC_CLOSE_HANDOFF,
+    REMOTE_QUIC_CLOSE_PROTOCOL, REMOTE_QUIC_CLOSE_REPLACED, REMOTE_QUIC_CLOSE_RESYNC,
+    REMOTE_QUIC_CLOSE_SHUTDOWN,
 };
 
 use crate::server::client_transport::{
@@ -34,18 +39,26 @@ const MAX_TOKENS: usize = 64;
 const MAX_CONTROL_ITEMS: usize = 64;
 const MAX_CONTROL_BYTES: usize = 1024 * 1024;
 const MAX_RESOURCE_TRANSFERS: usize = 2;
+/// Outbound resource bytes are admitted against a byte-weighted budget, in
+/// KiB so the total fits a `Semaphore`'s permit count: at most
+/// `MAX_RESOURCE_TRANSFERS` maximum-size resources may be buffered for
+/// transfer at once, however many refs a frame carries.
+const RESOURCE_BUDGET_KIB: usize = MAX_RESOURCE_TRANSFERS * REMOTE_QUIC_MAX_RESOURCE_SIZE / 1024;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const TOKEN_MIN_LIFETIME: Duration = Duration::from_secs(60);
 const TOKEN_MAX_LIFETIME: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+/// The server's own NAT keep-alive. The client drives resume probes; this is
+/// only the cheap heartbeat that keeps a middlebox binding warm well inside
+/// `remote.quic_transport_idle_timeout_seconds`.
+const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(15);
 // Flow-control caps, not allocations; see the client-side note in
 // src/remote/quic.rs. Sized for the render stream's burst, which carries
 // multi-MB graphics frames, not for one high-latency link profile.
 const QUIC_SEND_WINDOW: u64 = 4 * 1024 * 1024;
 const QUIC_STREAM_RECEIVE_WINDOW: u32 = 256 * 1024;
 const QUIC_RECEIVE_WINDOW: u32 = 1024 * 1024;
-const REPLACED_CODE: u32 = 0x100;
-const AUTH_CODE: u32 = 0x101;
-const PROTOCOL_CODE: u32 = 0x102;
+// Connection close codes live in src/remote/quic_policy.rs: they are on the
+// wire, so the client and the server must read them from one place.
 
 #[derive(Debug)]
 struct Capability {
@@ -69,11 +82,16 @@ struct ServerState {
 /// local bootstrap request, so ordinary/local Herdr never binds UDP or creates TLS material.
 pub(crate) struct RemoteQuicServer {
     endpoints: Vec<Endpoint>,
+    /// Duplicates of the bound UDP sockets, kept only so a live handoff can
+    /// pass the listening sockets to the successor process. They are never
+    /// read from: quinn owns its own duplicate of each.
+    sockets: Vec<UdpSocket>,
     state: Arc<ServerState>,
     port: u16,
-    certificate_fingerprint: [u8; REMOTE_QUIC_HASH_BYTES],
+    identity: ServerIdentity,
     token_lifetime: Duration,
     ssh_fallback_available: bool,
+    handed_off: AtomicBool,
 }
 
 impl RemoteQuicServer {
@@ -82,14 +100,15 @@ impl RemoteQuicServer {
         server_event_tx: mpsc::Sender<ServerEvent>,
     ) -> Result<Self, String> {
         let (start_port, end_port) = parse_port_range(&config.quic_port_range)?;
-        let token_lifetime = Duration::from_secs(config.quic_idle_timeout_seconds)
-            .clamp(TOKEN_MIN_LIFETIME, TOKEN_MAX_LIFETIME);
-        let (server_config, certificate_fingerprint) =
-            make_server_config(token_lifetime).map_err(|err| err.to_string())?;
-        let (endpoints, port) =
-            bind_endpoints(server_config, start_port, end_port).map_err(|err| {
-                format!("failed to bind remote QUIC port {start_port}-{end_port}: {err}")
-            })?;
+        let identity = ServerIdentity::generate().map_err(|err| err.to_string())?;
+        let server_config =
+            make_server_config(&identity, config.validated_transport_idle_timeout())
+                .map_err(|err| err.to_string())?;
+        let (sockets, port) = bind_sockets(start_port, end_port).map_err(|err| {
+            format!("failed to bind remote QUIC port {start_port}-{end_port}: {err}")
+        })?;
+        let endpoints = make_endpoints(&server_config, &sockets)
+            .map_err(|err| format!("failed to start remote QUIC endpoint on port {port}: {err}"))?;
 
         let mut server_instance_id = [0u8; REMOTE_QUIC_ID_BYTES];
         getrandom::fill(&mut server_instance_id)
@@ -112,11 +131,13 @@ impl RemoteQuicServer {
         );
         Ok(Self {
             endpoints,
+            sockets,
             state,
             port,
-            certificate_fingerprint,
-            token_lifetime,
+            identity,
+            token_lifetime: token_lifetime(config),
             ssh_fallback_available: config.ssh_fallback,
+            handed_off: AtomicBool::new(false),
         })
     }
 
@@ -150,7 +171,14 @@ impl RemoteQuicServer {
             {
                 if let Some(removed) = tokens.remove(&oldest) {
                     if let Some(connection) = removed.active_connection {
-                        connection.close(VarInt::from_u32(REPLACED_CODE), b"capability evicted");
+                        // The capability is gone from the table, so the token
+                        // this client holds can no longer validate: it has to
+                        // bootstrap a new one rather than retry with a
+                        // credential that now resolves to nothing.
+                        connection.close(
+                            VarInt::from_u32(REMOTE_QUIC_CLOSE_EVICTED),
+                            b"capability evicted",
+                        );
                     }
                 }
             }
@@ -171,23 +199,239 @@ impl RemoteQuicServer {
             version: PROTOCOL_VERSION,
             server_instance_id: self.state.server_instance_id,
             port: self.port,
-            certificate_fingerprint: self.certificate_fingerprint,
+            certificate_fingerprint: self.identity.fingerprint,
             capability_token: token,
             expires_unix_seconds,
             ssh_fallback_available: self.ssh_fallback_available,
+        })
+    }
+
+    /// Closes every endpoint with the handoff code, telling connected clients
+    /// to reconnect with the capability they already hold instead of
+    /// rebootstrapping over SSH. Suppresses the shutdown close on drop.
+    pub(crate) fn close_for_handoff(&self) {
+        self.handed_off.store(true, Ordering::Release);
+        for endpoint in &self.endpoints {
+            endpoint.close(
+                VarInt::from_u32(REMOTE_QUIC_CLOSE_HANDOFF),
+                b"server handoff",
+            );
+        }
+    }
+
+    /// Closes every live client connection while keeping the endpoints
+    /// listening and the capability table intact, so each client re-dials
+    /// *this* process with the credential it already holds.
+    ///
+    /// The rollback counterpart of [`Self::close_for_handoff`]: a handoff that
+    /// fails before the commit has already dropped its clients from the
+    /// server's client table, and a still-healthy connection is exactly what
+    /// keeps the client from noticing that its client id no longer exists.
+    pub(crate) fn close_connections(&self, code: u32, reason: &[u8]) {
+        let mut closed = 0usize;
+        for capability in lock(&self.state.tokens).values_mut() {
+            // Taken, not just closed: the capability's generation is
+            // unchanged, so the reconnect fences itself past this one, and a
+            // dead connection has no business staying reachable here.
+            if let Some(connection) = capability.active_connection.take() {
+                connection.close(VarInt::from_u32(code), reason);
+                closed += 1;
+            }
+        }
+        if closed > 0 {
+            info!(closed, code, "closed live remote QUIC connections");
+        }
+    }
+
+    /// Snapshots everything a successor process needs to keep existing
+    /// capabilities usable, together with duplicates of the listening UDP
+    /// sockets (IPv4 first, then IPv6 when bound).
+    pub(crate) fn export_handoff(&self) -> io::Result<(RemoteQuicHandoffState, Vec<OwnedFd>)> {
+        let mut fds = Vec::with_capacity(self.sockets.len());
+        for socket in &self.sockets {
+            fds.push(OwnedFd::from(socket.try_clone()?));
+        }
+        let socket_fd_count = u8::try_from(fds.len()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "too many remote QUIC sockets to hand off",
+            )
+        })?;
+        let tokens = lock(&self.state.tokens)
+            .iter()
+            .map(|(token_hash, capability)| HandoffToken {
+                token_hash: *token_hash,
+                session: capability.session.clone(),
+                logical_client_id: capability.logical_client_id,
+                expires_unix_seconds: capability.expires_unix_seconds,
+                connection_generation: capability.connection_generation,
+                issued_order: capability.issued_order,
+            })
+            .collect();
+        Ok((
+            RemoteQuicHandoffState {
+                server_instance_id: self.state.server_instance_id,
+                certificate_der: self.identity.certificate_der.clone(),
+                private_key_der: self.identity.private_key_der.clone(),
+                certificate_fingerprint: self.identity.fingerprint,
+                port: self.port,
+                socket_fd_count,
+                tokens,
+            },
+            fds,
+        ))
+    }
+
+    /// Rebuilds the endpoint in a successor process from the exported state
+    /// and the inherited sockets. The server instance id, certificate, and
+    /// port are preserved, so a client's existing capability and pinned
+    /// certificate fingerprint keep validating: it reconnects instead of
+    /// rebootstrapping over SSH.
+    pub(crate) fn import_handoff(
+        state: RemoteQuicHandoffState,
+        fds: Vec<OwnedFd>,
+        config: &RemoteConfig,
+        server_event_tx: mpsc::Sender<ServerEvent>,
+    ) -> io::Result<Self> {
+        if fds.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "remote QUIC handoff carried no sockets",
+            ));
+        }
+        let identity = ServerIdentity {
+            certificate_der: state.certificate_der,
+            private_key_der: state.private_key_der,
+            fingerprint: state.certificate_fingerprint,
+        };
+        let server_config =
+            make_server_config(&identity, config.validated_transport_idle_timeout()).map_err(
+                |err| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("failed to restore remote QUIC certificate: {err}"),
+                    )
+                },
+            )?;
+        let mut sockets = Vec::with_capacity(fds.len());
+        for fd in fds {
+            let socket = UdpSocket::from(fd);
+            socket.set_nonblocking(true)?;
+            sockets.push(socket);
+        }
+        let endpoints = make_endpoints(&server_config, &sockets)?;
+
+        let now = unix_seconds();
+        let mut inherited: Vec<HandoffToken> = state
+            .tokens
+            .into_iter()
+            .filter(|token| token.expires_unix_seconds > now)
+            .collect();
+        // Newest capabilities win if the snapshot somehow carries more than
+        // this process would ever mint.
+        inherited.sort_unstable_by_key(|token| std::cmp::Reverse(token.issued_order));
+        inherited.truncate(MAX_TOKENS);
+        let token_order = inherited
+            .iter()
+            .map(|token| token.issued_order)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
+        let tokens = inherited
+            .into_iter()
+            .map(|token| {
+                (
+                    token.token_hash,
+                    Capability {
+                        session: token.session,
+                        logical_client_id: token.logical_client_id,
+                        expires_unix_seconds: token.expires_unix_seconds,
+                        connection_generation: token.connection_generation,
+                        active_connection: None,
+                        issued_order: token.issued_order,
+                    },
+                )
+            })
+            .collect::<HashMap<_, _>>();
+
+        let server_state = Arc::new(ServerState {
+            server_instance_id: state.server_instance_id,
+            tokens: Mutex::new(tokens),
+            token_order: AtomicU64::new(token_order),
+            next_client_id: AtomicU64::new(1u64 << 63),
+            server_event_tx,
+        });
+        for endpoint in &endpoints {
+            tokio::spawn(accept_connections(
+                endpoint.clone(),
+                Arc::clone(&server_state),
+            ));
+        }
+        info!(
+            port = state.port,
+            endpoints = endpoints.len(),
+            capabilities = lock(&server_state.tokens).len(),
+            "remote QUIC endpoint resumed from handoff"
+        );
+        Ok(Self {
+            endpoints,
+            sockets,
+            state: server_state,
+            port: state.port,
+            identity,
+            token_lifetime: token_lifetime(config),
+            ssh_fallback_available: config.ssh_fallback,
+            handed_off: AtomicBool::new(false),
         })
     }
 }
 
 impl Drop for RemoteQuicServer {
     fn drop(&mut self) {
+        if self.handed_off.load(Ordering::Acquire) {
+            // `close_for_handoff` already told clients to reconnect; a second
+            // close would look like a permanent shutdown.
+            return;
+        }
         for endpoint in &self.endpoints {
             endpoint.close(
-                VarInt::from_u32(REPLACED_CODE),
-                b"server handoff or shutdown",
+                VarInt::from_u32(REMOTE_QUIC_CLOSE_SHUTDOWN),
+                b"server shutdown",
             );
         }
     }
+}
+
+/// Everything a successor process needs to keep already-issued capabilities
+/// valid across a live handoff.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct RemoteQuicHandoffState {
+    pub(crate) server_instance_id: [u8; REMOTE_QUIC_ID_BYTES],
+    pub(crate) certificate_der: Vec<u8>,
+    pub(crate) private_key_der: Vec<u8>,
+    pub(crate) certificate_fingerprint: [u8; REMOTE_QUIC_HASH_BYTES],
+    pub(crate) port: u16,
+    /// Number of UDP socket descriptors that travel with this state.
+    #[serde(default)]
+    pub(crate) socket_fd_count: u8,
+    pub(crate) tokens: Vec<HandoffToken>,
+}
+
+/// One capability, hashed rather than in the clear: the plaintext token never
+/// leaves the client.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct HandoffToken {
+    pub(crate) token_hash: [u8; REMOTE_QUIC_HASH_BYTES],
+    pub(crate) session: String,
+    pub(crate) logical_client_id: [u8; REMOTE_QUIC_ID_BYTES],
+    pub(crate) expires_unix_seconds: u64,
+    pub(crate) connection_generation: u64,
+    pub(crate) issued_order: u64,
+}
+
+fn token_lifetime(config: &RemoteConfig) -> Duration {
+    Duration::from_secs(config.quic_idle_timeout_seconds)
+        .clamp(TOKEN_MIN_LIFETIME, TOKEN_MAX_LIFETIME)
 }
 
 fn parse_port_range(value: &str) -> Result<(u16, u16), String> {
@@ -208,14 +452,34 @@ fn parse_port_range(value: &str) -> Result<(u16, u16), String> {
     Ok((start, end))
 }
 
+/// The self-signed TLS material the client pins by fingerprint. Kept in DER
+/// so a live handoff can rebuild the exact same identity in the successor.
+#[derive(Clone)]
+struct ServerIdentity {
+    certificate_der: Vec<u8>,
+    private_key_der: Vec<u8>,
+    fingerprint: [u8; REMOTE_QUIC_HASH_BYTES],
+}
+
+impl ServerIdentity {
+    fn generate() -> Result<Self, Box<dyn std::error::Error>> {
+        let rcgen::CertifiedKey { cert, signing_key } =
+            rcgen::generate_simple_self_signed(vec!["herdr".to_owned()])?;
+        let certificate_der = cert.der().to_vec();
+        Ok(Self {
+            fingerprint: hash_bytes(&certificate_der),
+            certificate_der,
+            private_key_der: signing_key.serialize_der(),
+        })
+    }
+}
+
 fn make_server_config(
+    identity: &ServerIdentity,
     idle_timeout: Duration,
-) -> Result<(quinn::ServerConfig, [u8; REMOTE_QUIC_HASH_BYTES]), Box<dyn std::error::Error>> {
-    let rcgen::CertifiedKey { cert, signing_key } =
-        rcgen::generate_simple_self_signed(vec!["herdr".to_owned()])?;
-    let cert_der = cert.der().clone();
-    let fingerprint = hash_bytes(cert_der.as_ref());
-    let key = rustls::pki_types::PrivatePkcs8KeyDer::from(signing_key.serialize_der()).into();
+) -> Result<quinn::ServerConfig, Box<dyn std::error::Error>> {
+    let cert_der = rustls::pki_types::CertificateDer::from(identity.certificate_der.clone());
+    let key = rustls::pki_types::PrivatePkcs8KeyDer::from(identity.private_key_der.clone()).into();
     let mut tls = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(vec![cert_der], key)?;
@@ -226,7 +490,7 @@ fn make_server_config(
     let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(crypto));
     server_config.migration(true);
     server_config.transport_config(Arc::new(transport_config(idle_timeout)?));
-    Ok((server_config, fingerprint))
+    Ok(server_config)
 }
 
 fn transport_config(idle_timeout: Duration) -> Result<quinn::TransportConfig, io::Error> {
@@ -239,7 +503,7 @@ fn transport_config(idle_timeout: Duration) -> Result<quinn::TransportConfig, io
     })?;
     transport
         .max_idle_timeout(Some(idle))
-        .keep_alive_interval(Some(Duration::from_secs(15)))
+        .keep_alive_interval(Some(KEEP_ALIVE_INTERVAL))
         .max_concurrent_bidi_streams(VarInt::from_u32(2))
         .max_concurrent_uni_streams(VarInt::from_u32(0))
         .stream_receive_window(VarInt::from_u32(QUIC_STREAM_RECEIVE_WINDOW))
@@ -252,11 +516,11 @@ fn transport_config(idle_timeout: Duration) -> Result<quinn::TransportConfig, io
     Ok(transport)
 }
 
-fn bind_endpoints(
-    server_config: quinn::ServerConfig,
-    start_port: u16,
-    end_port: u16,
-) -> io::Result<(Vec<Endpoint>, u16)> {
+/// Binds the first port in the range that IPv4 accepts. IPv6 is best effort
+/// at that same port: refusing the port because its v6 half is taken would
+/// leave the client with no endpoint at all, so the failure is logged and the
+/// IPv4-only listener is kept.
+fn bind_sockets(start_port: u16, end_port: u16) -> io::Result<(Vec<UdpSocket>, u16)> {
     let mut last_error = None;
     for port in start_port..=end_port {
         let ipv4_address = SocketAddr::from((Ipv4Addr::UNSPECIFIED, port));
@@ -267,23 +531,31 @@ fn bind_endpoints(
                 continue;
             }
         };
-        let mut endpoints = vec![make_endpoint(server_config.clone(), ipv4_socket)?];
+        let mut sockets = vec![ipv4_socket];
 
         let ipv6_address = SocketAddr::from((Ipv6Addr::UNSPECIFIED, port));
         match bind_udp_socket(Domain::IPV6, ipv6_address) {
-            Ok(socket) => endpoints.push(make_endpoint(server_config.clone(), socket)?),
-            Err(error) if error.kind() == io::ErrorKind::AddrInUse => {
-                last_error = Some(error);
-                continue;
-            }
+            Ok(socket) => sockets.push(socket),
             Err(error) => {
                 debug!(%error, port, "IPv6 QUIC listener unavailable; using IPv4");
             }
         }
-        return Ok((endpoints, port));
+        return Ok((sockets, port));
     }
     Err(last_error
         .unwrap_or_else(|| io::Error::new(io::ErrorKind::AddrNotAvailable, "empty port range")))
+}
+
+/// Hands quinn its own duplicate of each socket, so the originals stay
+/// available for a later handoff.
+fn make_endpoints(
+    server_config: &quinn::ServerConfig,
+    sockets: &[UdpSocket],
+) -> io::Result<Vec<Endpoint>> {
+    sockets
+        .iter()
+        .map(|socket| make_endpoint(server_config.clone(), socket.try_clone()?))
+        .collect()
 }
 
 fn bind_udp_socket(domain: Domain, address: SocketAddr) -> io::Result<UdpSocket> {
@@ -326,8 +598,10 @@ async fn accept_connections(endpoint: Endpoint, state: Arc<ServerState>) {
                 Ok(connection) => {
                     if let Err(err) = serve_connection(connection.clone(), state).await {
                         debug!(err = %err, remote = %connection.remote_address(), "remote QUIC connection ended");
-                        connection
-                            .close(VarInt::from_u32(PROTOCOL_CODE), err.to_string().as_bytes());
+                        connection.close(
+                            VarInt::from_u32(REMOTE_QUIC_CLOSE_PROTOCOL),
+                            err.to_string().as_bytes(),
+                        );
                     }
                 }
                 Err(err) => debug!(err = %err, "remote QUIC handshake failed"),
@@ -355,7 +629,7 @@ async fn serve_connection(connection: Connection, state: Arc<ServerState>) -> Re
     .await
     .map_err(|_| "timed out waiting for QUIC hello".to_owned())??;
 
-    validate_and_fence(&state, &connection, &hello)?;
+    let fence = validate_and_fence(&state, &connection, &hello)?;
     let keybindings = parse_client_keybindings(hello.keybindings.clone())?;
     if hello.launch_mode != ClientLaunchMode::App {
         return Err("remote QUIC currently accepts app clients only".to_owned());
@@ -403,6 +677,7 @@ async fn serve_connection(connection: Connection, state: Arc<ServerState>) -> Re
         .map_err(|_| "server event loop stopped".to_owned())?;
 
     let control_publisher = tokio::spawn(publish_control_output(
+        connection.clone(),
         control_send,
         Arc::clone(&control_queue),
     ));
@@ -420,7 +695,8 @@ async fn serve_connection(connection: Connection, state: Arc<ServerState>) -> Re
     let read_result = receive_client_control(
         &mut control_recv,
         client_id,
-        &state.server_event_tx,
+        &state,
+        fence,
         &heartbeat_writer,
     )
     .await;
@@ -430,7 +706,7 @@ async fn serve_connection(connection: Connection, state: Arc<ServerState>) -> Re
         .await;
     control_publisher.abort();
     render_publisher.abort();
-    clear_active_connection(&state, &hello.capability_token, hello.connection_generation);
+    clear_active_connection(&state, fence);
     read_result
 }
 
@@ -506,11 +782,19 @@ fn validate_capability(
     Ok(token_hash)
 }
 
+/// Identifies one accepted connection inside its capability, so late input
+/// from a replaced connection can be told apart from the live one's.
+#[derive(Clone, Copy)]
+struct ConnectionFence {
+    token_hash: [u8; REMOTE_QUIC_HASH_BYTES],
+    connection_generation: u64,
+}
+
 fn validate_and_fence(
     state: &ServerState,
     connection: &Connection,
     hello: &RemoteQuicHello,
-) -> Result<(), String> {
+) -> Result<ConnectionFence, String> {
     let active_session = crate::session::active_name()
         .unwrap_or_else(|| crate::session::DEFAULT_SESSION_NAME.to_owned());
     let mut tokens = lock(&state.tokens);
@@ -525,10 +809,16 @@ fn validate_and_fence(
         Err(error) => {
             match error {
                 CapabilityValidationError::ProtocolMismatch { .. } => {
-                    connection.close(VarInt::from_u32(PROTOCOL_CODE), b"protocol mismatch");
+                    connection.close(
+                        VarInt::from_u32(REMOTE_QUIC_CLOSE_PROTOCOL),
+                        b"protocol mismatch",
+                    );
                 }
                 CapabilityValidationError::StaleGeneration => {
-                    connection.close(VarInt::from_u32(AUTH_CODE), b"stale connection generation");
+                    connection.close(
+                        VarInt::from_u32(REMOTE_QUIC_CLOSE_AUTH),
+                        b"stale connection generation",
+                    );
                 }
                 _ => {}
             }
@@ -540,31 +830,48 @@ fn validate_and_fence(
     };
     if let Some(previous) = capability.active_connection.replace(connection.clone()) {
         previous.close(
-            VarInt::from_u32(REPLACED_CODE),
+            VarInt::from_u32(REMOTE_QUIC_CLOSE_REPLACED),
             b"newer connection generation accepted",
         );
     }
     capability.connection_generation = hello.connection_generation;
-    Ok(())
+    Ok(ConnectionFence {
+        token_hash,
+        connection_generation: hello.connection_generation,
+    })
 }
 
-fn clear_active_connection(state: &ServerState, token: &[u8], generation: u64) {
-    let token_hash = hash_bytes(token);
-    if let Some(capability) = lock(&state.tokens).get_mut(&token_hash) {
-        if capability.connection_generation == generation {
+fn clear_active_connection(state: &ServerState, fence: ConnectionFence) {
+    if let Some(capability) = lock(&state.tokens).get_mut(&fence.token_hash) {
+        if capability.connection_generation == fence.connection_generation {
             capability.active_connection = None;
         }
     }
 }
 
+/// Closing a replaced connection does not unread what it already delivered:
+/// quinn hands the stream's queued bytes to the reader regardless, so input
+/// typed before a roam could be replayed behind the resumed connection's
+/// input. Every decoded frame is fenced against the capability's current
+/// generation instead.
+fn fence_is_current(state: &ServerState, fence: ConnectionFence) -> bool {
+    lock(&state.tokens)
+        .get(&fence.token_hash)
+        .is_some_and(|capability| capability.connection_generation == fence.connection_generation)
+}
+
 async fn receive_client_control(
-    recv: &mut RecvStream,
+    recv: &mut (impl tokio::io::AsyncRead + Unpin),
     client_id: u64,
-    server_event_tx: &mpsc::Sender<ServerEvent>,
+    state: &ServerState,
+    fence: ConnectionFence,
     heartbeat_writer: &QuicControlSender,
 ) -> Result<(), String> {
     loop {
         let message: ClientMessage = read_async_message(recv, MAX_GRAPHICS_FRAME_SIZE).await?;
+        if !fence_is_current(state, fence) {
+            return Err("remote connection replaced by a newer generation".to_owned());
+        }
         let message = match message {
             ClientMessage::RemotePing { nonce } => {
                 let mut framed = Vec::new();
@@ -585,7 +892,8 @@ async fn receive_client_control(
             continue;
         };
         let detached = matches!(event, ServerEvent::ClientDetach { .. });
-        server_event_tx
+        state
+            .server_event_tx
             .send(event)
             .await
             .map_err(|_| "server event loop stopped".to_owned())?;
@@ -607,7 +915,7 @@ impl std::fmt::Debug for QuicControlSender {
 }
 
 impl QuicControlSender {
-    fn new() -> (Self, Arc<BoundedControlQueue>) {
+    pub(crate) fn new() -> (Self, Arc<BoundedControlQueue>) {
         let queue = Arc::new(BoundedControlQueue::default());
         (
             Self {
@@ -618,20 +926,16 @@ impl QuicControlSender {
     }
 
     pub(crate) fn send(&self, data: Vec<u8>) -> Result<(), std::sync::mpsc::SendError<Vec<u8>>> {
-        self.queue.send(data)
+        self.queue
+            .send(data)
+            .map_err(|(_, data)| std::sync::mpsc::SendError(data))
     }
 }
 
 #[derive(Default)]
-struct BoundedControlQueue {
+pub(crate) struct BoundedControlQueue {
     state: Mutex<ControlQueueState>,
     ready: Notify,
-}
-
-struct QueuedControl {
-    data: Vec<u8>,
-    key: Option<u8>,
-    drop_on_overflow: bool,
 }
 
 #[derive(Default)]
@@ -639,6 +943,16 @@ struct ControlQueueState {
     items: VecDeque<QueuedControl>,
     bytes: usize,
     closed: bool,
+    overflowed: bool,
+}
+
+/// A queued control frame with the policy decided at enqueue time: coalescing
+/// and overflow both scan the queue, and re-decoding every queued frame on
+/// every send made that scan quadratic in bincode work.
+struct QueuedControl {
+    key: Option<u8>,
+    drop_on_overflow: bool,
+    data: Vec<u8>,
 }
 
 impl ControlQueueState {
@@ -649,11 +963,21 @@ impl ControlQueueState {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ControlSendError {
+    /// The publisher is gone; the connection is already finished.
+    Closed,
+    /// The queue is full of frames that must not be dropped. The connection
+    /// has to go: the client resyncs over a fresh one instead of silently
+    /// missing a shutdown or replace frame.
+    Overflow,
+}
+
 impl BoundedControlQueue {
-    fn send(&self, data: Vec<u8>) -> Result<(), std::sync::mpsc::SendError<Vec<u8>>> {
+    fn send(&self, data: Vec<u8>) -> Result<(), (ControlSendError, Vec<u8>)> {
         let mut state = lock(&self.state);
         if state.closed {
-            return Err(std::sync::mpsc::SendError(data));
+            return Err((ControlSendError::Closed, data));
         }
         let (key, drop_on_overflow) = match protocol::read_message::<_, ServerMessage>(
             &mut data.as_slice(),
@@ -674,12 +998,16 @@ impl BoundedControlQueue {
             return if drop_on_overflow {
                 Ok(())
             } else {
-                Err(std::sync::mpsc::SendError(data))
+                Err(Self::overflow(&mut state, data))
             };
         }
-        if let Some(k) = key {
-            if let Some(i) = state.items.iter().position(|q| q.key == Some(k)) {
-                state.remove_at(i);
+        if let Some(key) = key {
+            if let Some(index) = state
+                .items
+                .iter()
+                .position(|queued| queued.key == Some(key))
+            {
+                state.remove_at(index);
             }
         }
         while state.items.len() >= MAX_CONTROL_ITEMS
@@ -688,20 +1016,37 @@ impl BoundedControlQueue {
             if drop_on_overflow {
                 return Ok(());
             }
-            let Some(i) = state.items.iter().position(|q| q.drop_on_overflow) else {
-                return Err(std::sync::mpsc::SendError(data));
+            let Some(index) = state
+                .items
+                .iter()
+                .position(|queued| queued.drop_on_overflow)
+            else {
+                return Err(Self::overflow(&mut state, data));
             };
-            state.remove_at(i);
+            state.remove_at(index);
         }
         state.bytes = state.bytes.saturating_add(data.len());
         state.items.push_back(QueuedControl {
-            data,
             key,
             drop_on_overflow,
+            data,
         });
         drop(state);
         self.ready.notify_one();
         Ok(())
+    }
+
+    /// Marks the queue fatally full: already queued frames still drain, then
+    /// the publisher tears the connection down.
+    fn overflow(state: &mut ControlQueueState, data: Vec<u8>) -> (ControlSendError, Vec<u8>) {
+        warn!(
+            bytes = data.len(),
+            queued = state.items.len(),
+            "remote control queue overflowed with undroppable frames; closing connection"
+        );
+        state.overflowed = true;
+        state.closed = true;
+        (ControlSendError::Overflow, data)
     }
 
     async fn recv(&self) -> Option<Vec<u8>> {
@@ -709,9 +1054,9 @@ impl BoundedControlQueue {
             let notified = self.ready.notified();
             {
                 let mut state = lock(&self.state);
-                if let Some(item) = state.items.pop_front() {
-                    state.bytes = state.bytes.saturating_sub(item.data.len());
-                    return Some(item.data);
+                if let Some(queued) = state.items.pop_front() {
+                    state.bytes = state.bytes.saturating_sub(queued.data.len());
+                    return Some(queued.data);
                 }
                 if state.closed {
                     return None;
@@ -726,8 +1071,14 @@ impl BoundedControlQueue {
         self.ready.notify_waiters();
     }
 
+    fn overflowed(&self) -> bool {
+        lock(&self.state).overflowed
+    }
+
+    /// Queued item count and byte total, for tests asserting what a
+    /// connection was (or was not) told.
     #[cfg(test)]
-    fn bounds(&self) -> (usize, usize) {
+    pub(crate) fn bounds(&self) -> (usize, usize) {
         let state = lock(&self.state);
         (state.items.len(), state.bytes)
     }
@@ -754,7 +1105,7 @@ struct QuicRenderSenderInner {
 }
 
 impl QuicRenderSender {
-    fn new() -> (
+    pub(crate) fn new() -> (
         Self,
         mpsc::UnboundedReceiver<TerminalFrame>,
         watch::Receiver<u64>,
@@ -822,11 +1173,21 @@ impl QuicRenderSender {
     }
 }
 
-async fn publish_control_output(mut stream: SendStream, queue: Arc<BoundedControlQueue>) {
+async fn publish_control_output(
+    connection: Connection,
+    mut stream: SendStream,
+    queue: Arc<BoundedControlQueue>,
+) {
     while let Some(control) = queue.recv().await {
         if stream.write_all(&control).await.is_err() {
             break;
         }
+    }
+    if queue.overflowed() {
+        connection.close(
+            VarInt::from_u32(REMOTE_QUIC_CLOSE_RESYNC),
+            b"control queue overflow",
+        );
     }
     queue.close();
 }
@@ -841,17 +1202,11 @@ async fn publish_server_output(
     client_id: u64,
     server_event_tx: mpsc::Sender<ServerEvent>,
 ) {
-    let resource_limit = Arc::new(Semaphore::new(MAX_RESOURCE_TRANSFERS));
+    let resource_limit = Arc::new(Semaphore::new(RESOURCE_BUDGET_KIB));
     let sent_resources = Arc::new(Mutex::new(cached_resources));
     let state_revision = AtomicU64::new(0);
     let mut render_stream: Option<SendStream> = None;
     let mut active_generation = *generation_rx.borrow_and_update();
-    let reset_stream = |stream: &mut Option<SendStream>, gen_rx: &mut watch::Receiver<u64>| {
-        if let Some(mut s) = stream.take() {
-            let _ = s.reset(VarInt::from_u32(REPLACED_CODE));
-        }
-        *gen_rx.borrow_and_update()
-    };
 
     loop {
         tokio::select! {
@@ -860,7 +1215,10 @@ async fn publish_server_output(
                 if changed.is_err() {
                     break;
                 }
-                active_generation = reset_stream(&mut render_stream, &mut generation_rx);
+                active_generation = *generation_rx.borrow_and_update();
+                if let Some(mut stream) = render_stream.take() {
+                    let _ = stream.reset(VarInt::from_u32(REMOTE_QUIC_CLOSE_REPLACED));
+                }
             }
             render = render_rx.recv() => {
                 let Some(render) = render else { break; };
@@ -876,12 +1234,24 @@ async fn publish_server_output(
                     Arc::clone(&sent_resources),
                 ).await;
                 if result == PublishRenderResult::GenerationChanged {
-                    active_generation = reset_stream(&mut render_stream, &mut generation_rx);
+                    active_generation = *generation_rx.borrow_and_update();
+                    if let Some(mut stream) = render_stream.take() {
+                        let _ = stream.reset(VarInt::from_u32(REMOTE_QUIC_CLOSE_REPLACED));
+                    }
                 }
                 render_sender.busy.store(false, Ordering::Release);
                 let _ = server_event_tx.send(ServerEvent::ClientWriterDrained { client_id }).await;
                 if result == PublishRenderResult::Closed {
-                    let _ = server_event_tx.send(ServerEvent::ClientDisconnected { client_id }).await;
+                    // The publisher is the only thing that repaints this
+                    // client, so exiting on a write failure while the
+                    // connection is still up leaves a healthy session that
+                    // never updates again. Closing makes the client re-dial
+                    // with the capability it holds; an already-closed
+                    // connection ignores it.
+                    connection.close(
+                        VarInt::from_u32(REMOTE_QUIC_CLOSE_RESYNC),
+                        b"render write failed",
+                    );
                     break;
                 }
             }
@@ -889,7 +1259,7 @@ async fn publish_server_output(
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PublishRenderResult {
     Sent,
     GenerationChanged,
@@ -913,30 +1283,58 @@ async fn publish_render(
         && graphics
             .iter()
             .all(|segment| segment.bytes.len() <= REMOTE_QUIC_MAX_RESOURCE_SIZE);
-    let mut resources = Vec::new();
-    if can_externalize {
-        frame.bytes = text;
-        for segment in graphics {
-            let hash = hash_bytes(&segment.bytes);
-            resources.push(RemoteQuicResourceRef {
-                hash,
-                text_offset: segment.text_offset,
-            });
-            let should_send = lock(&sent_resources).insert(hash);
-            if should_send {
+    let admission = if can_externalize {
+        admit_resources(graphics, &resource_limit, &sent_resources)
+    } else {
+        None
+    };
+    // The queued message was admitted at `MAX_GRAPHICS_FRAME_SIZE`, and the
+    // record wraps it in a generation/revision/resource envelope, so a frame
+    // that already sits near that limit no longer fits once wrapped. Writing
+    // it anyway fails, ends this publisher, and strands the client on a
+    // healthy connection that never repaints again, so an oversize record is
+    // degraded to text instead: this frame loses its graphics, and a later
+    // one carries them as resources.
+    let (bytes, resources) = match admission {
+        Some(admission) => {
+            for transfer in admission.transfers {
                 spawn_resource_transfer(
                     connection.clone(),
                     connection_generation,
                     render_generation,
-                    hash,
-                    segment.bytes,
-                    Arc::clone(&resource_limit),
+                    transfer,
                 );
             }
+            // A resource ref costs more bytes than the shortest escape it
+            // replaces, so a frame packed with tiny graphics can grow. The
+            // bytes are already admitted and marked sent, so only this
+            // record's refs are dropped.
+            if projected_record_size(text.len(), admission.refs.len()) <= MAX_GRAPHICS_FRAME_SIZE {
+                (text, admission.refs)
+            } else {
+                warn!(
+                    text_bytes = text.len(),
+                    resources = admission.refs.len(),
+                    "QUIC render record with resource refs exceeds the frame limit; dropping this frame's graphics"
+                );
+                (text, Vec::new())
+            }
         }
-    } else {
-        frame.bytes = original;
-    }
+        // The transfer budget is committed to earlier frames, so nothing was
+        // cloned: ship the graphics inline and let a later render externalize
+        // them once those transfers drain.
+        None if projected_record_size(original.len(), 0) <= MAX_GRAPHICS_FRAME_SIZE => {
+            (original, Vec::new())
+        }
+        None => {
+            warn!(
+                inline_bytes = original.len(),
+                "inline QUIC graphics do not fit the render record; sending this frame text only"
+            );
+            (text, Vec::new())
+        }
+    };
+    frame.bytes = bytes;
 
     if render_stream.is_none() {
         let Ok(mut stream) = connection.open_uni().await else {
@@ -976,18 +1374,100 @@ async fn publish_render(
     }
 }
 
+/// Upper bound on the bincode bytes a [`RemoteQuicRenderRecord`] spends
+/// outside the frame payload: three varint generation/revision fences, the
+/// frame's own scalar fields and byte-length prefix, and the resource
+/// vector's length prefix.
+const RENDER_RECORD_ENVELOPE_BYTES: usize = 64;
+/// Upper bound on the bincode bytes one [`RemoteQuicResourceRef`] costs: a
+/// fixed-size hash plus a varint text offset.
+const RENDER_RECORD_RESOURCE_REF_BYTES: usize = REMOTE_QUIC_HASH_BYTES + 5;
+
+/// Conservative encoded size of the record that would carry `payload` frame
+/// bytes and `resources` resource references.
+///
+/// Sizing the record before it is built is what keeps a frame admitted at
+/// `MAX_GRAPHICS_FRAME_SIZE` from exceeding that same limit once the record
+/// envelope is added: `write_async_message` would reject it, and a rejected
+/// render write closes the connection instead of repainting the client.
+fn projected_record_size(payload: usize, resources: usize) -> usize {
+    payload
+        .saturating_add(RENDER_RECORD_ENVELOPE_BYTES)
+        .saturating_add(resources.saturating_mul(RENDER_RECORD_RESOURCE_REF_BYTES))
+}
+
+/// One admitted graphics resource: its bytes plus the budget permit that
+/// covers them. Dropping the pair releases the budget, so the permit and the
+/// allocation it accounts for always live and die together.
+struct ResourceTransfer {
+    hash: [u8; REMOTE_QUIC_HASH_BYTES],
+    bytes: Vec<u8>,
+    permit: OwnedSemaphorePermit,
+}
+
+struct ResourceAdmission {
+    refs: Vec<RemoteQuicResourceRef>,
+    transfers: Vec<ResourceTransfer>,
+}
+
+/// Permit weight for one resource, in KiB rounded up so that even a tiny
+/// resource costs budget.
+fn resource_weight(len: usize) -> u32 {
+    u32::try_from(len.div_ceil(1024).max(1)).unwrap_or(u32::MAX)
+}
+
+/// Reserves transfer budget for every not-yet-sent resource in one frame
+/// *before* its bytes are cloned out of the frame, which is what bounds the
+/// resource memory a burst of graphics can pin.
+///
+/// All-or-nothing on purpose: a client cannot apply a render record that
+/// references a resource it never receives, so a frame that does not fit is
+/// reported as unadmitted and sent inline instead.
+fn admit_resources(
+    graphics: Vec<GraphicsSegment>,
+    limit: &Arc<Semaphore>,
+    sent_resources: &Mutex<HashSet<[u8; REMOTE_QUIC_HASH_BYTES]>>,
+) -> Option<ResourceAdmission> {
+    let mut refs = Vec::with_capacity(graphics.len());
+    let mut transfers: Vec<ResourceTransfer> = Vec::new();
+    let mut known = lock(sent_resources);
+    for segment in graphics {
+        let hash = hash_bytes(&segment.bytes);
+        refs.push(RemoteQuicResourceRef {
+            hash,
+            text_offset: segment.text_offset,
+        });
+        if known.contains(&hash) || transfers.iter().any(|transfer| transfer.hash == hash) {
+            continue;
+        }
+        let permit = Arc::clone(limit)
+            .try_acquire_many_owned(resource_weight(segment.bytes.len()))
+            .ok()?;
+        transfers.push(ResourceTransfer {
+            hash,
+            bytes: segment.bytes,
+            permit,
+        });
+    }
+    known.extend(transfers.iter().map(|transfer| transfer.hash));
+    Some(ResourceAdmission { refs, transfers })
+}
+
 fn spawn_resource_transfer(
     connection: Connection,
     connection_generation: u64,
     render_generation: u64,
-    hash: [u8; REMOTE_QUIC_HASH_BYTES],
-    bytes: Vec<u8>,
-    limit: Arc<Semaphore>,
+    transfer: ResourceTransfer,
 ) {
     tokio::spawn(async move {
-        let Ok(_permit) = limit.acquire_owned().await else {
-            return;
-        };
+        let ResourceTransfer {
+            hash,
+            bytes,
+            permit,
+        } = transfer;
+        // Held for the whole transfer: the budget only frees once these bytes
+        // are on the wire and dropped.
+        let _permit = permit;
         let Ok(mut stream) = connection.open_uni().await else {
             return;
         };
@@ -1027,11 +1507,11 @@ fn split_kitty_sequences(bytes: &[u8]) -> (Vec<u8>, Vec<GraphicsSegment>) {
     let mut text = Vec::with_capacity(bytes.len());
     let mut graphics = Vec::new();
     let mut cursor = 0;
-    while let Some(relative_start) = find_subslice(&bytes[cursor..], START) {
+    while let Some(relative_start) = memchr::memmem::find(&bytes[cursor..], START) {
         let start = cursor + relative_start;
         text.extend_from_slice(&bytes[cursor..start]);
         let payload_start = start + START.len();
-        let Some(relative_end) = find_subslice(&bytes[payload_start..], END) else {
+        let Some(relative_end) = memchr::memmem::find(&bytes[payload_start..], END) else {
             text.extend_from_slice(&bytes[start..]);
             return (text, graphics);
         };
@@ -1049,12 +1529,6 @@ fn split_kitty_sequences(bytes: &[u8]) -> (Vec<u8>, Vec<GraphicsSegment>) {
     (text, graphics)
 }
 
-fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack
-        .windows(needle.len())
-        .position(|window| window == needle)
-}
-
 fn unix_seconds() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1062,8 +1536,11 @@ fn unix_seconds() -> u64 {
         .as_secs()
 }
 
+/// `pub(crate)` because the handoff rollback path lives in
+/// `crate::server::headless` and needs the same live client fixture: one real
+/// QUIC connection is the only way to observe a close.
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::remote::quic_policy::{MAX_RECORD_OVERHEAD, STRUCTURAL_RECORD_HEADER_BOUND};
 
@@ -1299,30 +1776,41 @@ mod tests {
         assert!(bytes <= MAX_CONTROL_BYTES);
     }
 
-    #[test]
-    fn reliable_control_overflow_disconnects_instead_of_dropping_messages() {
-        let queue = BoundedControlQueue::default();
-        for index in 0..MAX_CONTROL_ITEMS {
-            let mut data = Vec::new();
-            protocol::write_message(
-                &mut data,
-                &ServerMessage::ServerShutdown {
-                    reason: Some(format!("critical-{index}")),
-                },
-            )
-            .expect("serialize critical control");
-            queue.send(data).expect("reliable queue capacity");
-        }
-        let mut overflow = Vec::new();
+    fn framed_shutdown(reason: &str) -> Vec<u8> {
+        let mut data = Vec::new();
         protocol::write_message(
-            &mut overflow,
+            &mut data,
             &ServerMessage::ServerShutdown {
-                reason: Some("must not disappear".to_owned()),
+                reason: Some(reason.to_owned()),
             },
         )
-        .expect("serialize overflow control");
-        assert!(queue.send(overflow).is_err());
+        .expect("serialize critical control");
+        data
+    }
+
+    #[tokio::test]
+    async fn reliable_control_overflow_closes_instead_of_dropping_messages() {
+        let (sender, queue) = QuicControlSender::new();
+        for index in 0..MAX_CONTROL_ITEMS {
+            sender
+                .send(framed_shutdown(&format!("critical-{index}")))
+                .expect("reliable queue capacity");
+        }
+        // The caller must learn that an undroppable frame did not make it, and
+        // the queue must mark itself fatal so the publisher closes the
+        // connection rather than leaving the client silently out of sync.
+        assert!(sender.send(framed_shutdown("must not disappear")).is_err());
+        assert!(queue.overflowed());
         assert_eq!(queue.bounds().0, MAX_CONTROL_ITEMS);
+
+        for index in 0..MAX_CONTROL_ITEMS {
+            assert_eq!(
+                queue.recv().await,
+                Some(framed_shutdown(&format!("critical-{index}"))),
+                "queued frames still drain before the close"
+            );
+        }
+        assert_eq!(queue.recv().await, None);
     }
 
     #[test]
@@ -1344,5 +1832,704 @@ mod tests {
         assert!(Arc::clone(&admission).try_acquire_owned().is_err());
         drop(permits);
         assert!(Arc::clone(&admission).try_acquire_owned().is_ok());
+    }
+
+    #[test]
+    fn transport_idle_timeout_is_separate_from_token_lifetime() {
+        let config = crate::config::RemoteConfig::default();
+        assert_eq!(token_lifetime(&config), Duration::from_secs(86_400));
+        assert_eq!(
+            config.validated_transport_idle_timeout(),
+            Duration::from_secs(45)
+        );
+
+        let transport =
+            transport_config(config.validated_transport_idle_timeout()).expect("transport config");
+        let rendered = format!("{transport:?}");
+        assert!(
+            rendered.contains(&format!(
+                "max_idle_timeout: {:?}",
+                Some(VarInt::from_u32(45_000))
+            )),
+            "transport must idle out on the transport timeout, not the token lifetime: {rendered}"
+        );
+        assert!(
+            rendered.contains(&format!(
+                "keep_alive_interval: {:?}",
+                Some(KEEP_ALIVE_INTERVAL)
+            )),
+            "{rendered}"
+        );
+    }
+
+    fn graphics_segments(count: usize, len: usize, fill: u8) -> Vec<GraphicsSegment> {
+        (0..count)
+            .map(|index| GraphicsSegment {
+                text_offset: index as u32,
+                // Distinct content per segment, so each hashes differently.
+                bytes: vec![fill.wrapping_add(index as u8); len],
+            })
+            .collect()
+    }
+
+    #[test]
+    fn resource_weight_charges_at_least_one_kib() {
+        assert_eq!(resource_weight(0), 1);
+        assert_eq!(resource_weight(1), 1);
+        assert_eq!(resource_weight(1024), 1);
+        assert_eq!(resource_weight(1025), 2);
+        assert_eq!(
+            RESOURCE_BUDGET_KIB,
+            MAX_RESOURCE_TRANSFERS * REMOTE_QUIC_MAX_RESOURCE_SIZE / 1024
+        );
+    }
+
+    #[tokio::test]
+    async fn resource_admission_never_buffers_beyond_the_budget() {
+        const MIB: usize = 1024 * 1024;
+        let budget = 4 * 1024;
+        let limit = Arc::new(Semaphore::new(budget));
+        let sent = Mutex::new(HashSet::new());
+
+        // Eight 1 MiB refs against a 4 MiB budget: the frame is refused
+        // outright, so none of those bytes are cloned or pinned.
+        assert!(admit_resources(graphics_segments(8, MIB, 0), &limit, &sent).is_none());
+        assert_eq!(limit.available_permits(), budget);
+        assert!(lock(&sent).is_empty());
+
+        let admission = admit_resources(graphics_segments(4, MIB, 0), &limit, &sent)
+            .expect("a frame inside the budget is admitted");
+        assert_eq!(admission.refs.len(), 4);
+        assert_eq!(admission.transfers.len(), 4);
+        assert_eq!(limit.available_permits(), 0);
+        assert_eq!(lock(&sent).len(), 4);
+
+        // Nothing else fits while those transfers hold their bytes.
+        assert!(admit_resources(graphics_segments(1, MIB, 200), &limit, &sent).is_none());
+
+        // Already-sent resources are referenced without re-buffering.
+        drop(admission);
+        assert_eq!(limit.available_permits(), budget);
+        let cached = admit_resources(graphics_segments(4, MIB, 0), &limit, &sent)
+            .expect("cached resources need no budget");
+        assert_eq!(cached.refs.len(), 4);
+        assert!(cached.transfers.is_empty());
+        assert_eq!(limit.available_permits(), budget);
+    }
+
+    fn fenced_state(
+        connection_generation: u64,
+        server_event_tx: mpsc::Sender<ServerEvent>,
+    ) -> (ServerState, ConnectionFence) {
+        let token_hash = hash_bytes(&[3; REMOTE_QUIC_TOKEN_BYTES]);
+        let mut tokens = HashMap::new();
+        tokens.insert(
+            token_hash,
+            Capability {
+                session: "session-a".to_owned(),
+                logical_client_id: [4; REMOTE_QUIC_ID_BYTES],
+                expires_unix_seconds: unix_seconds() + 600,
+                connection_generation,
+                active_connection: None,
+                issued_order: 1,
+            },
+        );
+        (
+            ServerState {
+                server_instance_id: [2; REMOTE_QUIC_ID_BYTES],
+                tokens: Mutex::new(tokens),
+                token_order: AtomicU64::new(2),
+                next_client_id: AtomicU64::new(1),
+                server_event_tx,
+            },
+            ConnectionFence {
+                token_hash,
+                connection_generation: 1,
+            },
+        )
+    }
+
+    async fn framed_input(data: &[u8]) -> Vec<u8> {
+        let mut buffer = Vec::new();
+        write_async_message(
+            &mut buffer,
+            &ClientMessage::Input {
+                data: data.to_vec(),
+            },
+            MAX_FRAME_SIZE,
+        )
+        .await
+        .expect("frame input");
+        buffer
+    }
+
+    #[tokio::test]
+    async fn live_connection_input_is_forwarded() {
+        let (server_event_tx, mut server_event_rx) = mpsc::channel(4);
+        let (state, fence) = fenced_state(1, server_event_tx);
+        let (writer, _queue) = QuicControlSender::new();
+        let input = framed_input(b"live").await;
+
+        let result = receive_client_control(&mut input.as_slice(), 7, &state, fence, &writer).await;
+        assert!(result.is_err(), "the stream ends after the last frame");
+        assert!(matches!(
+            server_event_rx.try_recv(),
+            Ok(ServerEvent::ClientInput { client_id: 7, .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn replaced_connection_input_is_never_forwarded() {
+        let (server_event_tx, mut server_event_rx) = mpsc::channel(4);
+        // A second connection for the same capability was accepted while this
+        // one still had input queued: the capability now sits at generation 2.
+        let (state, fence) = fenced_state(2, server_event_tx);
+        let (writer, _queue) = QuicControlSender::new();
+        let mut queued = framed_input(b"stale").await;
+        queued.extend(framed_input(b"stale-too").await);
+
+        let error = receive_client_control(&mut queued.as_slice(), 7, &state, fence, &writer)
+            .await
+            .expect_err("a replaced connection must stop reading");
+        assert!(error.contains("replaced by a newer generation"), "{error}");
+        assert!(server_event_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn handoff_export_and_import_keep_capabilities_valid() {
+        let probe = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind port probe");
+        let port = probe.local_addr().expect("probe address").port();
+        drop(probe);
+        let config = crate::config::RemoteConfig {
+            quic_port_range: format!("{port}-{port}"),
+            ..Default::default()
+        };
+        let session = crate::session::active_name()
+            .unwrap_or_else(|| crate::session::DEFAULT_SESSION_NAME.to_owned());
+        let (server_event_tx, _server_event_rx) = mpsc::channel(1);
+        let server = RemoteQuicServer::start(&config, server_event_tx).expect("start QUIC server");
+        let record = server
+            .bootstrap(RemoteBootstrapRequest {
+                session: session.clone(),
+                logical_client_id: [7; REMOTE_QUIC_ID_BYTES],
+            })
+            .expect("mint capability");
+
+        let (state, fds) = server.export_handoff().expect("export handoff");
+        assert_eq!(usize::from(state.socket_fd_count), fds.len());
+        assert_eq!(state.socket_fd_count as usize, server.endpoints.len());
+        assert_eq!(state.port, port);
+        assert_eq!(
+            state.certificate_fingerprint,
+            record.certificate_fingerprint
+        );
+        assert_eq!(state.server_instance_id, record.server_instance_id);
+        assert_eq!(state.tokens.len(), 1);
+
+        server.close_for_handoff();
+        drop(server);
+
+        let (resumed_event_tx, _resumed_event_rx) = mpsc::channel(1);
+        let resumed = RemoteQuicServer::import_handoff(state, fds, &config, resumed_event_tx)
+            .expect("import handoff");
+        // Same listening socket, same identity: the client's pinned
+        // fingerprint and its capability both still apply.
+        assert_eq!(resumed.port, port);
+        assert_eq!(
+            resumed
+                .sockets
+                .first()
+                .expect("inherited socket")
+                .local_addr()
+                .expect("inherited address")
+                .port(),
+            port
+        );
+        assert_eq!(resumed.identity.fingerprint, record.certificate_fingerprint);
+
+        let mut hello = capability_fixture().2;
+        hello.server_instance_id = record.server_instance_id;
+        hello.logical_client_id = [7; REMOTE_QUIC_ID_BYTES];
+        hello.capability_token = record.capability_token;
+        hello.connection_generation = 1;
+        let tokens = lock(&resumed.state.tokens);
+        assert_eq!(
+            validate_capability(
+                resumed.state.server_instance_id,
+                &tokens,
+                &hello,
+                &session,
+                unix_seconds(),
+            ),
+            Ok(hash_bytes(&record.capability_token))
+        );
+        drop(tokens);
+
+        // Freshly minted capabilities order after the inherited ones.
+        let next = resumed
+            .bootstrap(RemoteBootstrapRequest {
+                session,
+                logical_client_id: [8; REMOTE_QUIC_ID_BYTES],
+            })
+            .expect("mint after handoff");
+        assert_eq!(next.server_instance_id, record.server_instance_id);
+        assert_eq!(next.certificate_fingerprint, record.certificate_fingerprint);
+        assert_eq!(lock(&resumed.state.tokens).len(), 2);
+    }
+
+    /// Test-only stand-in for the client's own fingerprint verifier: these
+    /// tests dial the real endpoint, so they need the real self-signed
+    /// certificate to validate.
+    #[derive(Debug)]
+    struct PinnedTestCert {
+        fingerprint: [u8; REMOTE_QUIC_HASH_BYTES],
+        provider: Arc<rustls::crypto::CryptoProvider>,
+    }
+
+    impl rustls::client::danger::ServerCertVerifier for PinnedTestCert {
+        fn verify_server_cert(
+            &self,
+            end_entity: &rustls::pki_types::CertificateDer<'_>,
+            _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+            _server_name: &rustls::pki_types::ServerName<'_>,
+            _ocsp: &[u8],
+            _now: rustls::pki_types::UnixTime,
+        ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+            if hash_bytes(end_entity.as_ref()) == self.fingerprint {
+                Ok(rustls::client::danger::ServerCertVerified::assertion())
+            } else {
+                Err(rustls::Error::General("fingerprint mismatch".to_owned()))
+            }
+        }
+
+        fn verify_tls12_signature(
+            &self,
+            message: &[u8],
+            cert: &rustls::pki_types::CertificateDer<'_>,
+            dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            rustls::crypto::verify_tls12_signature(
+                message,
+                cert,
+                dss,
+                &self.provider.signature_verification_algorithms,
+            )
+        }
+
+        fn verify_tls13_signature(
+            &self,
+            message: &[u8],
+            cert: &rustls::pki_types::CertificateDer<'_>,
+            dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            rustls::crypto::verify_tls13_signature(
+                message,
+                cert,
+                dss,
+                &self.provider.signature_verification_algorithms,
+            )
+        }
+
+        fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+            self.provider
+                .signature_verification_algorithms
+                .supported_schemes()
+        }
+    }
+
+    /// One real client, connected and past the hello handshake, plus the
+    /// server side of the same connection as the token table sees it.
+    pub(crate) struct LiveTestClient {
+        _endpoint: Endpoint,
+        pub(crate) connection: Connection,
+        _control_send: SendStream,
+        _control_recv: quinn::RecvStream,
+        server_side: Connection,
+        record: RemoteBootstrapRecord,
+    }
+
+    pub(crate) fn test_server_on_free_port(
+    ) -> (RemoteQuicServer, mpsc::Receiver<ServerEvent>, String) {
+        let probe = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind port probe");
+        let port = probe.local_addr().expect("probe address").port();
+        drop(probe);
+        let config = crate::config::RemoteConfig {
+            quic_port_range: format!("{port}-{port}"),
+            ..Default::default()
+        };
+        let (server_event_tx, server_event_rx) = mpsc::channel(8);
+        let server = RemoteQuicServer::start(&config, server_event_tx).expect("start QUIC server");
+        let session = crate::session::active_name()
+            .unwrap_or_else(|| crate::session::DEFAULT_SESSION_NAME.to_owned());
+        (server, server_event_rx, session)
+    }
+
+    pub(crate) async fn connect_live_test_client(
+        server: &RemoteQuicServer,
+        session: &str,
+        logical_client_id: u8,
+    ) -> LiveTestClient {
+        let record = server
+            .bootstrap(RemoteBootstrapRequest {
+                session: session.to_owned(),
+                logical_client_id: [logical_client_id; REMOTE_QUIC_ID_BYTES],
+            })
+            .expect("mint capability");
+
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let mut tls = rustls::ClientConfig::builder_with_provider(Arc::clone(&provider))
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .expect("enable TLS 1.3")
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(PinnedTestCert {
+                fingerprint: record.certificate_fingerprint,
+                provider,
+            }))
+            .with_no_client_auth();
+        tls.alpn_protocols = vec![REMOTE_QUIC_ALPN.to_vec()];
+        let crypto =
+            quinn::crypto::rustls::QuicClientConfig::try_from(tls).expect("QUIC client crypto");
+        let mut client_config = quinn::ClientConfig::new(Arc::new(crypto));
+        let mut transport = quinn::TransportConfig::default();
+        transport.max_concurrent_uni_streams(VarInt::from_u32(8));
+        client_config.transport_config(Arc::new(transport));
+
+        let mut endpoint = Endpoint::client(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+            .expect("bind test client endpoint");
+        endpoint.set_default_client_config(client_config);
+        let connection = endpoint
+            .connect(
+                SocketAddr::from((Ipv4Addr::LOCALHOST, record.port)),
+                "herdr",
+            )
+            .expect("start QUIC connect")
+            .await
+            .expect("QUIC handshake");
+
+        let (mut control_send, mut control_recv) =
+            connection.open_bi().await.expect("open control stream");
+        let mut hello = capability_fixture().2;
+        hello.server_instance_id = record.server_instance_id;
+        hello.logical_client_id = [logical_client_id; REMOTE_QUIC_ID_BYTES];
+        hello.capability_token = record.capability_token;
+        hello.connection_generation = 1;
+        write_async_message(&mut control_send, &hello, MAX_FRAME_SIZE)
+            .await
+            .expect("send hello");
+        assert!(matches!(
+            read_async_message::<ServerMessage>(&mut control_recv, MAX_FRAME_SIZE)
+                .await
+                .expect("read welcome"),
+            ServerMessage::Welcome { error: None, .. }
+        ));
+
+        // The welcome is written after `validate_and_fence`, so the capability
+        // now holds this connection.
+        let server_side = lock(&server.state.tokens)
+            .get(&hash_bytes(&record.capability_token))
+            .and_then(|capability| capability.active_connection.clone())
+            .expect("server side of the live connection");
+        LiveTestClient {
+            _endpoint: endpoint,
+            connection,
+            _control_send: control_send,
+            _control_recv: control_recv,
+            server_side,
+            record,
+        }
+    }
+
+    /// A handoff that fails before the commit restores this server, but its
+    /// QUIC clients were already dropped from the client table: only a close
+    /// makes them re-dial, and the endpoint and capability have to survive so
+    /// the re-dial lands here with the token the client already holds.
+    #[tokio::test]
+    async fn close_connections_closes_live_clients_but_keeps_endpoints_and_tokens() {
+        let (server, mut events, session) = test_server_on_free_port();
+        let client = connect_live_test_client(&server, &session, 21).await;
+        assert!(matches!(
+            events.recv().await,
+            Some(ServerEvent::ClientConnected { .. })
+        ));
+
+        server.close_connections(REMOTE_QUIC_CLOSE_HANDOFF, b"handoff rolled back");
+
+        let closed = tokio::time::timeout(Duration::from_secs(5), client.connection.closed())
+            .await
+            .expect("client learns the connection closed");
+        match closed {
+            quinn::ConnectionError::ApplicationClosed(frame) => assert_eq!(
+                u64::from(frame.error_code),
+                u64::from(REMOTE_QUIC_CLOSE_HANDOFF)
+            ),
+            other => panic!("expected an application close, got {other}"),
+        }
+
+        // Endpoint still listening, capability still valid: the client comes
+        // back as a fresh connection on the credential it already has.
+        assert!(!server.handed_off.load(Ordering::Acquire));
+        let token_hash = hash_bytes(&client.record.capability_token);
+        let tokens = lock(&server.state.tokens);
+        let capability = tokens.get(&token_hash).expect("capability survives");
+        assert!(capability.active_connection.is_none());
+        assert_eq!(capability.connection_generation, 1);
+        let mut hello = capability_fixture().2;
+        hello.server_instance_id = server.state.server_instance_id;
+        hello.logical_client_id = [21; REMOTE_QUIC_ID_BYTES];
+        hello.capability_token = client.record.capability_token;
+        hello.connection_generation = 2;
+        assert_eq!(
+            validate_capability(
+                server.state.server_instance_id,
+                &tokens,
+                &hello,
+                &session,
+                unix_seconds(),
+            ),
+            Ok(token_hash)
+        );
+    }
+
+    /// A frame admitted at the frame limit no longer fits once the render
+    /// record's envelope is added, and failing that write would end the
+    /// publisher on a healthy connection: the graphics are dropped from this
+    /// one frame instead.
+    #[tokio::test]
+    async fn a_near_limit_inline_graphics_frame_is_published_as_text() {
+        let (server, mut events, session) = test_server_on_free_port();
+        let client = connect_live_test_client(&server, &session, 22).await;
+        assert!(matches!(
+            events.recv().await,
+            Some(ServerEvent::ClientConnected { .. })
+        ));
+
+        // One inline graphics segment, sized so the frame is admissible at
+        // MAX_GRAPHICS_FRAME_SIZE but the record around it would not be.
+        let head = b"head";
+        let mut bytes = Vec::with_capacity(MAX_GRAPHICS_FRAME_SIZE);
+        bytes.extend_from_slice(head);
+        bytes.extend_from_slice(b"\x1b_Gf=100,i=1;");
+        bytes.resize(MAX_GRAPHICS_FRAME_SIZE - 32 - 2, b'A');
+        bytes.extend_from_slice(b"\x1b\\");
+        assert_eq!(bytes.len(), MAX_GRAPHICS_FRAME_SIZE - 32);
+        assert!(
+            projected_record_size(bytes.len(), 0) > MAX_GRAPHICS_FRAME_SIZE,
+            "the fixture must not fit the record limit inline, or it tests nothing"
+        );
+        let frame = crate::protocol::TerminalFrame {
+            seq: 1,
+            width: 80,
+            height: 24,
+            full: true,
+            bytes,
+        };
+
+        // Budget fully committed to earlier transfers, which is what forces
+        // the inline fallback in the first place.
+        let (_generation_tx, mut generation_rx) = watch::channel(1u64);
+        let mut render_stream = None;
+        let result = publish_render(
+            &client.server_side,
+            &mut render_stream,
+            &mut generation_rx,
+            1,
+            1,
+            1,
+            frame,
+            Arc::new(Semaphore::new(0)),
+            Arc::new(Mutex::new(HashSet::new())),
+        )
+        .await;
+        assert_eq!(result, PublishRenderResult::Sent);
+
+        let mut stream =
+            tokio::time::timeout(Duration::from_secs(5), client.connection.accept_uni())
+                .await
+                .expect("render stream arrives")
+                .expect("accept render stream");
+        assert!(matches!(
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                read_async_message::<RemoteQuicStreamHeader>(&mut stream, MAX_FRAME_SIZE),
+            )
+            .await
+            .expect("render header arrives")
+            .expect("read render header"),
+            RemoteQuicStreamHeader::Render { .. }
+        ));
+        // Timed out rather than awaited: an oversize record is never written
+        // and, until the publisher closes, never will be — the exact hang this
+        // guard exists to prevent.
+        let record = tokio::time::timeout(
+            Duration::from_secs(5),
+            read_async_message::<RemoteQuicRenderRecord>(&mut stream, MAX_GRAPHICS_FRAME_SIZE),
+        )
+        .await
+        .expect("render record arrives")
+        .expect("read render record");
+        assert_eq!(record.frame.bytes, head);
+        assert!(record.resources.is_empty());
+    }
+
+    #[test]
+    fn the_record_envelope_estimate_bounds_the_encoded_record() {
+        let refs = 1024;
+        let record = RemoteQuicRenderRecord {
+            connection_generation: u64::MAX,
+            render_generation: u64::MAX,
+            state_revision: u64::MAX,
+            frame: crate::protocol::TerminalFrame {
+                seq: u64::MAX,
+                width: u16::MAX,
+                height: u16::MAX,
+                full: true,
+                bytes: vec![0u8; 64 * 1024],
+            },
+            resources: (0..refs)
+                .map(|index| RemoteQuicResourceRef {
+                    hash: [7; REMOTE_QUIC_HASH_BYTES],
+                    text_offset: index,
+                })
+                .collect(),
+        };
+        let encoded = bincode::serde::encode_to_vec(&record, bincode::config::standard())
+            .expect("encode record");
+        assert!(
+            encoded.len() <= projected_record_size(record.frame.bytes.len(), refs as usize),
+            "envelope estimate {} must bound the encoded record {}",
+            projected_record_size(record.frame.bytes.len(), refs as usize),
+            encoded.len()
+        );
+    }
+
+    fn framed_terminal(bytes: &[u8]) -> Vec<u8> {
+        let mut framed = Vec::new();
+        protocol::write_message(
+            &mut framed,
+            &ServerMessage::Terminal(crate::protocol::TerminalFrame {
+                seq: 1,
+                width: 80,
+                height: 24,
+                full: true,
+                bytes: bytes.to_vec(),
+            }),
+        )
+        .expect("frame terminal message");
+        framed
+    }
+
+    /// The publisher is the only thing that repaints a client, so exiting on
+    /// a write failure without closing leaves a healthy connection that never
+    /// updates again.
+    #[tokio::test]
+    async fn a_failed_render_write_closes_the_connection_for_resync() {
+        let (server, mut events, session) = test_server_on_free_port();
+        let client = connect_live_test_client(&server, &session, 23).await;
+        assert!(matches!(
+            events.recv().await,
+            Some(ServerEvent::ClientConnected { .. })
+        ));
+
+        let (render_writer, render_rx, generation_rx) = QuicRenderSender::new();
+        let (drain_tx, mut drain_rx) = mpsc::channel(8);
+        tokio::spawn(publish_server_output(
+            client.server_side.clone(),
+            render_rx,
+            generation_rx,
+            Arc::clone(&render_writer.inner),
+            1,
+            HashSet::new(),
+            7,
+            drain_tx,
+        ));
+
+        render_writer
+            .try_send(framed_terminal(b"first"))
+            .expect("queue the first render");
+        let mut stream =
+            tokio::time::timeout(Duration::from_secs(5), client.connection.accept_uni())
+                .await
+                .expect("render stream arrives")
+                .expect("accept render stream");
+        assert!(matches!(
+            read_async_message::<RemoteQuicStreamHeader>(&mut stream, MAX_FRAME_SIZE)
+                .await
+                .expect("read render header"),
+            RemoteQuicStreamHeader::Render { .. }
+        ));
+        let record =
+            read_async_message::<RemoteQuicRenderRecord>(&mut stream, MAX_GRAPHICS_FRAME_SIZE)
+                .await
+                .expect("read render record");
+        assert_eq!(record.frame.bytes, b"first");
+        assert!(matches!(
+            drain_rx.recv().await,
+            Some(ServerEvent::ClientWriterDrained { .. })
+        ));
+
+        // The client stops the render stream while the connection stays up:
+        // the next record cannot be written, which is the failure the close
+        // has to report.
+        stream
+            .stop(VarInt::from_u32(0))
+            .expect("stop the render stream");
+        let mut closed = None;
+        // STOP_SENDING has to reach the server before its next write fails.
+        for _ in 0..50 {
+            let _ = render_writer.try_send(framed_terminal(b"second"));
+            if let Ok(reason) =
+                tokio::time::timeout(Duration::from_millis(100), client.connection.closed()).await
+            {
+                closed = Some(reason);
+                break;
+            }
+        }
+        match closed.expect("the publisher closes after a failed render write") {
+            quinn::ConnectionError::ApplicationClosed(frame) => assert_eq!(
+                u64::from(frame.error_code),
+                u64::from(REMOTE_QUIC_CLOSE_RESYNC),
+                "a stale render stream must make the client re-dial"
+            ),
+            other => panic!("expected an application close, got {other}"),
+        }
+    }
+
+    /// Eviction removes the capability itself, so the token the client holds
+    /// can never validate again: it has to bootstrap a new one instead of
+    /// reconnecting with the one it has, which is what `REPLACED` means.
+    #[tokio::test]
+    async fn evicting_a_capability_closes_its_connection_as_evicted() {
+        let (server, mut events, session) = test_server_on_free_port();
+        let client = connect_live_test_client(&server, &session, 24).await;
+        assert!(matches!(
+            events.recv().await,
+            Some(ServerEvent::ClientConnected { .. })
+        ));
+
+        // The live client holds the oldest capability, so overflowing the
+        // token table evicts exactly that one.
+        for index in 0..=MAX_TOKENS {
+            server
+                .bootstrap(RemoteBootstrapRequest {
+                    session: session.clone(),
+                    logical_client_id: [index as u8; REMOTE_QUIC_ID_BYTES],
+                })
+                .expect("issue bounded capability");
+        }
+        assert!(
+            !lock(&server.state.tokens).contains_key(&hash_bytes(&client.record.capability_token))
+        );
+
+        let closed = tokio::time::timeout(Duration::from_secs(5), client.connection.closed())
+            .await
+            .expect("the evicted client learns its capability is gone");
+        match closed {
+            quinn::ConnectionError::ApplicationClosed(frame) => assert_eq!(
+                u64::from(frame.error_code),
+                u64::from(REMOTE_QUIC_CLOSE_EVICTED),
+                "an evicted capability must send the client back to bootstrap"
+            ),
+            other => panic!("expected an application close, got {other}"),
+        }
     }
 }

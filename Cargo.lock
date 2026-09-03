@@ -815,6 +815,7 @@ dependencies = [
  "interprocess",
  "jsonc-parser",
  "libc",
+ "memchr",
  "png",
  "portable-pty",
  "quinn",

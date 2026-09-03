@@ -1,11 +1,12 @@
 //! Local Unix-socket proxy that keeps the thin client alive while remote transports recover.
 
 use std::io;
-use std::net::Shutdown;
+use std::net::{Shutdown, SocketAddr};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc as sync_mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -31,7 +32,23 @@ const ACCEPT_POLL: Duration = Duration::from_millis(50);
 const SOCKET_PERMISSION_MODE: u32 = 0o600;
 const INPUT_QUEUE_ITEMS: usize = 64;
 const OUTPUT_QUEUE_ITEMS: usize = 16;
-const SSH_RECONNECT_DELAY: Duration = Duration::from_secs(1);
+const SHUTDOWN_POLL: Duration = Duration::from_millis(100);
+/// Head start the QUIC handshake gets before the SSH stdio bridge joins the
+/// first-attach race.
+const SSH_RACE_HEAD_START: Duration = Duration::from_millis(500);
+const RACE_POLL: Duration = Duration::from_millis(50);
+/// Delay between consecutive QUIC dials so the preferred address wins a tie
+/// without giving up the whole per-candidate budget on a black hole.
+const QUIC_DIAL_STAGGER: Duration = Duration::from_millis(250);
+const SSH_RECONNECT_BASE_DELAY: Duration = Duration::from_secs(1);
+const SSH_RECONNECT_MAX_DELAY: Duration = Duration::from_secs(30);
+/// `1 << 5` seconds already exceeds [`SSH_RECONNECT_MAX_DELAY`]; the shift is
+/// capped so the doubling cannot overflow on a long-lived failure streak.
+const SSH_RECONNECT_MAX_SHIFT: u32 = 5;
+const SSH_RECONNECT_GIVE_UP: Duration = Duration::from_secs(600);
+/// A bridge session that lasted this long counts as progress and resets the
+/// reconnect backoff.
+const SSH_SESSION_PROGRESS: Duration = Duration::from_secs(5);
 const SSH_REBOOTSTRAP_DEADLINE: Duration = Duration::from_secs(15);
 const SSH_REBOOTSTRAP_RETRY_DELAY: Duration = Duration::from_millis(250);
 /// First delay before retrying QUIC after a live session dropped, doubling per
@@ -47,6 +64,10 @@ const MAX_CONSECUTIVE_QUIC_RETRIES: u32 = 5;
 /// A session that stayed up this long counts as healthy, so its next failure
 /// starts a fresh retry budget instead of inheriting an old outage's count.
 const QUIC_SESSION_STABLE_AFTER: Duration = Duration::from_secs(30);
+/// Shown to the local client when the remote server fenced this session
+/// because a newer generation of the same capability took over: reconnecting
+/// would only fence out the client that just replaced this one.
+const REMOTE_SESSION_SUPERSEDED: &str = "another client took over this remote session";
 
 pub(super) struct BridgeConfig {
     pub(super) target: String,
@@ -75,6 +96,9 @@ impl ResumableRemoteBridge {
         listener.set_nonblocking(true)?;
 
         let local_socket = config.local_socket.clone();
+        // Shared: the first-attach race hands the SSH bridge handshake to a
+        // helper thread that outlives an early QUIC win.
+        let config = Arc::new(config);
         let should_stop = Arc::new(AtomicBool::new(false));
         let thread_stop = Arc::clone(&should_stop);
         let thread = thread::spawn(move || {
@@ -302,10 +326,23 @@ fn read_local_input(input_stream: &mut impl io::Read, router: &InputRouter) {
     router.mark_closed();
 }
 
+/// Decide whether the SSH stdio bridge may carry the live session.
+///
+/// `transport = "quic"` means QUIC only: it never falls back to the stdio
+/// bridge (it still uses SSH to authenticate and mint QUIC credentials), so
+/// `ssh_fallback` applies to `auto` alone.
+fn ssh_stream_allowed(config: &RemoteConfig) -> bool {
+    match config.transport {
+        RemoteTransportConfig::Ssh => true,
+        RemoteTransportConfig::Quic => false,
+        RemoteTransportConfig::Auto => config.ssh_fallback,
+    }
+}
+
 fn bridge_connection(
     mut stream: UnixStream,
-    config: &BridgeConfig,
-    should_stop: &AtomicBool,
+    config: &Arc<BridgeConfig>,
+    should_stop: &Arc<AtomicBool>,
 ) -> io::Result<()> {
     let hello_message: ClientMessage = crate::protocol::read_message(&mut stream, MAX_FRAME_SIZE)
         .map_err(|error| io::Error::other(error.to_string()))?;
@@ -343,19 +380,48 @@ fn bridge_connection(
         ssh_fallback = config.remote_config.ssh_fallback,
         "remote transport bridge started"
     );
+    let ssh_stream = ssh_stream_allowed(&config.remote_config);
     let mut use_ssh = config.remote_config.transport == RemoteTransportConfig::Ssh;
+    let mut ssh_winner: Option<SshHandshake> = None;
 
     if !use_ssh {
-        match run_quic(
+        // Racing needs a bootstrap to dial; without one QUIC is already known
+        // to be unavailable and the bridge starts immediately instead.
+        let race_ssh_bridge = ssh_stream && config.bootstrap.is_some();
+        match run_transport_ladder(
             &runtime,
             config,
             Arc::clone(&router),
             output_tx.clone(),
             &mut client_phase,
+            should_stop,
+            race_ssh_bridge,
+            &mut ssh_winner,
         ) {
             QuicOutcome::Detached => {}
+            QuicOutcome::SshRaceWon => {
+                info!(
+                    target = %config.target,
+                    "remote SSH bridge won the first-attach race"
+                );
+                use_ssh = true;
+            }
+            QuicOutcome::Superseded(detail) => {
+                warn!(
+                    target = %config.target,
+                    reason = %detail,
+                    "remote session was taken over by another client"
+                );
+                // Terminal even when the SSH bridge is available: attaching
+                // again would fence out the client that took over.
+                send_proxy_error(
+                    &output_tx,
+                    &mut client_phase,
+                    REMOTE_SESSION_SUPERSEDED.to_owned(),
+                );
+            }
             QuicOutcome::Fallback(detail) => {
-                if config.remote_config.ssh_fallback {
+                if ssh_stream {
                     warn!(
                         target = %config.target,
                         reason = %detail,
@@ -382,7 +448,10 @@ fn bridge_connection(
             output_tx.clone(),
             &mut client_phase,
             should_stop,
+            ssh_winner.take(),
         );
+    } else if let Some(handshake) = ssh_winner.take() {
+        handshake.discard();
     }
 
     router.mark_closed();
@@ -395,6 +464,13 @@ fn bridge_connection(
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum QuicOutcome {
     Detached,
+    /// The first-attach race was won by the SSH stdio bridge. The live
+    /// handshake travels out of band, like a connected QUIC session does.
+    SshRaceWon,
+    /// A newer generation of the same capability took over the remote
+    /// session. Terminal: this client exits instead of fencing the client
+    /// that replaced it back out.
+    Superseded(String),
     Fallback(String),
 }
 
@@ -431,6 +507,7 @@ fn quic_reconnect_delay(retries: u32) -> Duration {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum TransportPhase {
+    InitialRace,
     QuicConnecting(QuicAttempt),
     /// Carries the retry budget spent reaching this session so an immediately
     /// failing session cannot reset it by connecting successfully.
@@ -444,6 +521,7 @@ enum TransportPhase {
 enum TransportEvent {
     QuicConnected,
     QuicConnectFailed(String),
+    SshRaceWon,
     SessionExited {
         exit: SessionExit,
         /// Whether the session stayed up long enough to count as healthy.
@@ -456,6 +534,7 @@ enum TransportEvent {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum TransportAction {
+    RaceInitialTransports,
     ConnectQuic {
         recovering: bool,
         detail: Option<String>,
@@ -484,13 +563,24 @@ fn next_transport_phase(
     }
 
     match (phase, event) {
+        (TransportPhase::InitialRace, TransportEvent::QuicConnected) => (
+            TransportPhase::QuicLive(0),
+            TransportAction::RunQuic { recovering: false },
+        ),
+        (TransportPhase::InitialRace, TransportEvent::SshRaceWon) => (
+            TransportPhase::Done(QuicOutcome::SshRaceWon),
+            TransportAction::Finish,
+        ),
         (TransportPhase::QuicConnecting(attempt), TransportEvent::QuicConnected) => (
             TransportPhase::QuicLive(attempt.retries()),
             TransportAction::RunQuic {
                 recovering: attempt != QuicAttempt::Initial,
             },
         ),
-        (
+        // Both first-attach transports failed, or the very first QUIC dial
+        // failed with the race disabled: the SSH reconnect loop owns retrying.
+        (TransportPhase::InitialRace, TransportEvent::QuicConnectFailed(detail))
+        | (
             TransportPhase::QuicConnecting(QuicAttempt::Initial),
             TransportEvent::QuicConnectFailed(detail),
         )
@@ -549,6 +639,16 @@ fn next_transport_phase(
         (
             TransportPhase::QuicLive(_),
             TransportEvent::SessionExited {
+                exit: SessionExit::Superseded(detail),
+                ..
+            },
+        ) => (
+            TransportPhase::Done(QuicOutcome::Superseded(detail)),
+            TransportAction::Finish,
+        ),
+        (
+            TransportPhase::QuicLive(_),
+            TransportEvent::SessionExited {
                 exit: SessionExit::Detached,
                 ..
             },
@@ -579,12 +679,223 @@ fn next_transport_phase(
     }
 }
 
-fn run_quic(
+struct QuicDial {
+    bootstrap: RemoteBootstrapRecord,
+    candidates: Vec<SocketAddr>,
+    logical_client_id: [u8; REMOTE_QUIC_ID_BYTES],
+    connection_generation: u64,
+    hello: HelloState,
+    resource_cache: Arc<Mutex<ResourceCache>>,
+}
+
+/// Dial every resolved address at once, Happy-Eyeballs style: one QUIC
+/// handshake per candidate, staggered so the preferred (IPv6-first) address
+/// keeps a small head start, and the first completed handshake wins. The
+/// remaining dials are aborted when this future resolves. Every dial carries
+/// the same connection generation, so the server fences all but one of them
+/// out even if two handshakes overlap; at most one can be accepted.
+async fn dial_quic_candidates(dial: QuicDial) -> Result<(QuicSession, ServerMessage), String> {
+    let QuicDial {
+        bootstrap,
+        candidates,
+        logical_client_id,
+        connection_generation,
+        hello,
+        resource_cache,
+    } = dial;
+
+    let mut dials = tokio::task::JoinSet::new();
+    for (index, candidate) in candidates.into_iter().enumerate() {
+        let params = ConnectParams {
+            bootstrap: bootstrap.clone(),
+            candidates: vec![candidate],
+            logical_client_id,
+            connection_generation,
+            cols: hello.cols,
+            rows: hello.rows,
+            cell_width_px: hello.cell_width_px,
+            cell_height_px: hello.cell_height_px,
+            keybindings: hello.keybindings.clone(),
+        };
+        let cache = Arc::clone(&resource_cache);
+        let stagger = QUIC_DIAL_STAGGER.saturating_mul(u32::try_from(index).unwrap_or(u32::MAX));
+        dials.spawn(async move {
+            if !stagger.is_zero() {
+                tokio::time::sleep(stagger).await;
+            }
+            (candidate, QuicSession::connect(params, cache).await)
+        });
+    }
+
+    // Only the winner's result reaches the transport state machine: a loser's
+    // error (typically a stale-generation or duplicate-attach close of a
+    // candidate the server fenced out) is collected here but reported only
+    // when every dial failed, so it can never turn a successful attach into a
+    // rebootstrap decision.
+    let mut errors = Vec::new();
+    while let Some(joined) = dials.join_next().await {
+        match joined {
+            Ok((_, Ok(connected))) => return Ok(connected),
+            Ok((candidate, Err(error))) => errors.push(format!("{candidate}: {error}")),
+            Err(error) => errors.push(format!("QUIC dial task failed: {error}")),
+        }
+    }
+    if errors.is_empty() {
+        return Err("remote QUIC bootstrap returned no reachable address candidates".to_owned());
+    }
+    Err(format!(
+        "all remote QUIC paths failed: {}",
+        errors.join("; ")
+    ))
+}
+
+enum RaceEvent {
+    Quic(Result<Box<(QuicSession, ServerMessage)>, String>),
+    Ssh(Result<Box<SshHandshake>, SshExit>),
+}
+
+enum RaceOutcome {
+    Quic(Box<(QuicSession, ServerMessage)>),
+    Ssh(Box<SshHandshake>),
+    Failed(String),
+    Detached,
+}
+
+/// Hand a race result to the coordinator, or tear it down when the
+/// coordinator already picked the other transport and dropped the receiver.
+fn send_race_event(events: &sync_mpsc::Sender<RaceEvent>, event: RaceEvent) {
+    if let Err(sync_mpsc::SendError(event)) = events.send(event) {
+        match event {
+            RaceEvent::Ssh(Ok(handshake)) => handshake.discard(),
+            // Dropping the session drops its quinn endpoint and connection,
+            // which closes the losing QUIC path.
+            RaceEvent::Quic(_) | RaceEvent::Ssh(Err(_)) => {}
+        }
+    }
+}
+
+/// Race the QUIC handshake against the SSH stdio bridge on first attach.
+///
+/// QUIC gets a head start, then the SSH bridge starts in parallel; the first
+/// completed handshake wins and the loser is torn down. Without this, a host
+/// that silently drops UDP would wait out the whole QUIC deadline before the
+/// bridge is even spawned, making the first attach strictly slower than the
+/// plain SSH bridge it replaced.
+fn race_initial_transports(
     runtime: &tokio::runtime::Runtime,
-    config: &BridgeConfig,
+    config: &Arc<BridgeConfig>,
+    router: &Arc<InputRouter>,
+    should_stop: &Arc<AtomicBool>,
+    dial: QuicDial,
+) -> RaceOutcome {
+    let (events, results) = sync_mpsc::channel::<RaceEvent>();
+    let hello = dial.hello.clone();
+    let settled = Arc::new(AtomicBool::new(false));
+    let ssh_child = SshBridgeChild::default();
+
+    let quic_events = events.clone();
+    let quic_dial = runtime.spawn(async move {
+        let result = dial_quic_candidates(dial).await;
+        send_race_event(&quic_events, RaceEvent::Quic(result.map(Box::new)));
+    });
+
+    let ssh_config = Arc::clone(config);
+    let ssh_router = Arc::clone(router);
+    let ssh_stop = Arc::clone(should_stop);
+    let ssh_settled = Arc::clone(&settled);
+    let ssh_child_handle = ssh_child.clone();
+    let ssh_thread = thread::Builder::new()
+        .name("herdr-remote-ssh-race".to_owned())
+        .spawn(move || {
+            if !sleep_interruptible(SSH_RACE_HEAD_START, &ssh_router, &ssh_stop) {
+                return;
+            }
+            // QUIC already won inside its head start: never spawn ssh at all,
+            // so the common healthy case costs no remote process.
+            if ssh_settled.load(Ordering::Acquire) {
+                return;
+            }
+            let result = ssh_handshake(&ssh_config, &hello, &ssh_child_handle).map(Box::new);
+            send_race_event(&events, RaceEvent::Ssh(result));
+        });
+    let mut pending_ssh = match ssh_thread {
+        // The worker is deliberately detached rather than joined: cancelling
+        // the race kills its child, which unblocks its blocking handshake
+        // reads and lets it exit on its own, whereas joining here would let a
+        // wedged ssh process stall the winning attach.
+        Ok(_) => true,
+        Err(error) => {
+            warn!(%error, "failed to start the racing SSH bridge; using QUIC only");
+            false
+        }
+    };
+
+    let mut pending_quic = true;
+    let mut failures = Vec::new();
+    let outcome = loop {
+        if !pending_quic && !pending_ssh {
+            break RaceOutcome::Failed(race_failure_detail(&failures));
+        }
+        match results.recv_timeout(RACE_POLL) {
+            Ok(RaceEvent::Quic(Ok(connected))) => break RaceOutcome::Quic(connected),
+            Ok(RaceEvent::Ssh(Ok(handshake))) => break RaceOutcome::Ssh(handshake),
+            Ok(RaceEvent::Quic(Err(detail))) => {
+                pending_quic = false;
+                failures.push(format!("QUIC: {detail}"));
+            }
+            Ok(RaceEvent::Ssh(Err(exit))) => {
+                pending_ssh = false;
+                failures.push(format!("SSH bridge: {}", ssh_exit_detail(&exit)));
+            }
+            Err(sync_mpsc::RecvTimeoutError::Timeout) => {
+                if router.is_detached() || should_stop.load(Ordering::Acquire) {
+                    break RaceOutcome::Detached;
+                }
+            }
+            Err(sync_mpsc::RecvTimeoutError::Disconnected) => {
+                break RaceOutcome::Failed(race_failure_detail(&failures));
+            }
+        }
+    };
+
+    settled.store(true, Ordering::Release);
+    match &outcome {
+        // The bridge won: its child belongs to the returned handshake now.
+        // Stop the losing dial before it can register a second attach with
+        // the remote server; a completed-but-unwanted session is dropped by
+        // send_race_event instead.
+        RaceOutcome::Ssh(_) => quic_dial.abort(),
+        RaceOutcome::Detached => {
+            quic_dial.abort();
+            ssh_child.cancel();
+        }
+        // `settled` only stops a worker that has not spawned ssh yet, so the
+        // published child is killed as well: that unblocks a worker parked in
+        // the blocking welcome read and reaps the process here instead of
+        // leaving it, and its thread, alive for the life of the proxy.
+        RaceOutcome::Quic(_) | RaceOutcome::Failed(_) => {
+            ssh_child.cancel();
+        }
+    }
+    outcome
+}
+
+fn race_failure_detail(failures: &[String]) -> String {
+    if failures.is_empty() {
+        return "remote transport race produced no result".to_owned();
+    }
+    failures.join("; ")
+}
+
+fn run_transport_ladder(
+    runtime: &tokio::runtime::Runtime,
+    config: &Arc<BridgeConfig>,
     router: Arc<InputRouter>,
     output: mpsc::Sender<ServerMessage>,
     client_phase: &mut LocalClientPhase,
+    should_stop: &Arc<AtomicBool>,
+    race_ssh_bridge: bool,
+    ssh_winner: &mut Option<SshHandshake>,
 ) -> QuicOutcome {
     let Some(mut bootstrap) = config.bootstrap.clone() else {
         return QuicOutcome::Fallback(
@@ -601,11 +912,20 @@ fn run_quic(
     let resource_cache = Arc::new(Mutex::new(ResourceCache::default()));
     let mut connection_generation = 0u64;
     let mut connected_session = None;
-    let mut phase = TransportPhase::QuicConnecting(QuicAttempt::Initial);
-    let mut action = TransportAction::ConnectQuic {
-        recovering: false,
-        detail: None,
-        delay: Duration::ZERO,
+    let (mut phase, mut action) = if race_ssh_bridge {
+        (
+            TransportPhase::InitialRace,
+            TransportAction::RaceInitialTransports,
+        )
+    } else {
+        (
+            TransportPhase::QuicConnecting(QuicAttempt::Initial),
+            TransportAction::ConnectQuic {
+                recovering: false,
+                detail: None,
+                delay: Duration::ZERO,
+            },
+        )
     };
 
     loop {
@@ -614,6 +934,50 @@ fn run_quic(
         }
 
         let event = match action {
+            TransportAction::RaceInitialTransports => {
+                let candidates = match remote_quic_candidates(hostname, bootstrap.port) {
+                    Ok(candidates) => candidates,
+                    Err(error) => {
+                        (phase, action) = next_transport_phase(
+                            phase,
+                            TransportEvent::QuicConnectFailed(error.to_string()),
+                        );
+                        continue;
+                    }
+                };
+                connection_generation = connection_generation.saturating_add(1);
+                info!(
+                    target = %config.target,
+                    generation = connection_generation,
+                    candidates = candidates.len(),
+                    "racing remote QUIC transport against the SSH bridge"
+                );
+                let dial = QuicDial {
+                    bootstrap: bootstrap.clone(),
+                    candidates,
+                    logical_client_id: config.logical_client_id,
+                    connection_generation,
+                    hello: router.hello(),
+                    resource_cache: Arc::clone(&resource_cache),
+                };
+                match race_initial_transports(runtime, config, &router, should_stop, dial) {
+                    RaceOutcome::Quic(connected) => {
+                        info!(
+                            target = %config.target,
+                            generation = connection_generation,
+                            "remote QUIC transport won the first-attach race"
+                        );
+                        connected_session = Some(*connected);
+                        TransportEvent::QuicConnected
+                    }
+                    RaceOutcome::Ssh(handshake) => {
+                        *ssh_winner = Some(*handshake);
+                        TransportEvent::SshRaceWon
+                    }
+                    RaceOutcome::Failed(detail) => TransportEvent::QuicConnectFailed(detail),
+                    RaceOutcome::Detached => TransportEvent::ClientDetached,
+                }
+            }
             TransportAction::ConnectQuic {
                 recovering,
                 detail,
@@ -668,21 +1032,14 @@ fn run_quic(
                     recovering,
                     "connecting remote QUIC transport"
                 );
-                let hello = router.hello();
-                match runtime.block_on(QuicSession::connect(
-                    ConnectParams {
-                        bootstrap: bootstrap.clone(),
-                        candidates,
-                        logical_client_id: config.logical_client_id,
-                        connection_generation,
-                        cols: hello.cols,
-                        rows: hello.rows,
-                        cell_width_px: hello.cell_width_px,
-                        cell_height_px: hello.cell_height_px,
-                        keybindings: hello.keybindings,
-                    },
-                    Arc::clone(&resource_cache),
-                )) {
+                match runtime.block_on(dial_quic_candidates(QuicDial {
+                    bootstrap: bootstrap.clone(),
+                    candidates,
+                    logical_client_id: config.logical_client_id,
+                    connection_generation,
+                    hello: router.hello(),
+                    resource_cache: Arc::clone(&resource_cache),
+                })) {
                     Ok(connected) => {
                         info!(
                             target = %config.target,
@@ -781,47 +1138,200 @@ fn rebootstrap(config: &BridgeConfig) -> io::Result<RemoteBootstrapRecord> {
     }
 }
 
+/// Sleep in short slices so a long reconnect backoff never delays detach or
+/// bridge shutdown. Returns false when the wait was cut short.
+fn sleep_interruptible(total: Duration, router: &InputRouter, should_stop: &AtomicBool) -> bool {
+    let deadline = Instant::now() + total;
+    loop {
+        if router.is_detached() || should_stop.load(Ordering::Acquire) {
+            return false;
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return true;
+        }
+        thread::sleep(deadline.saturating_duration_since(now).min(SHUTDOWN_POLL));
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SshRetryDecision {
+    Wait(Duration),
+    GiveUp(Duration),
+}
+
+/// Exponential reconnect backoff for the SSH bridge: 1s, 2s, 4s ... capped at
+/// [`SSH_RECONNECT_MAX_DELAY`]. A bridge that keeps failing for
+/// [`SSH_RECONNECT_GIVE_UP`] gives up so the client exits with the underlying
+/// SSH error instead of spinning forever on, say, a revoked key.
+fn ssh_retry_decision(consecutive_failures: u32, failing_for: Duration) -> SshRetryDecision {
+    if failing_for >= SSH_RECONNECT_GIVE_UP {
+        return SshRetryDecision::GiveUp(failing_for);
+    }
+    let shift = consecutive_failures
+        .saturating_sub(1)
+        .min(SSH_RECONNECT_MAX_SHIFT);
+    let delay = SSH_RECONNECT_BASE_DELAY
+        .saturating_mul(1u32 << shift)
+        .min(SSH_RECONNECT_MAX_DELAY);
+    SshRetryDecision::Wait(delay)
+}
+
+#[derive(Default)]
+struct SshRetryState {
+    consecutive_failures: u32,
+    failing_since: Option<Instant>,
+}
+
+impl SshRetryState {
+    fn record_failure(&mut self, now: Instant) -> SshRetryDecision {
+        let since = *self.failing_since.get_or_insert(now);
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        ssh_retry_decision(
+            self.consecutive_failures,
+            now.saturating_duration_since(since),
+        )
+    }
+
+    fn record_progress(&mut self) {
+        self.consecutive_failures = 0;
+        self.failing_since = None;
+    }
+}
+
 fn run_ssh_reconnect_loop(
     config: &BridgeConfig,
     router: Arc<InputRouter>,
     output: mpsc::Sender<ServerMessage>,
     client_phase: &mut LocalClientPhase,
     should_stop: &AtomicBool,
+    mut connected: Option<SshHandshake>,
 ) {
     let mut attempt = 0u64;
+    let mut retry = SshRetryState::default();
     while !router.is_detached() && !should_stop.load(Ordering::Acquire) {
-        if client_phase.is_connected()
-            && output
-                .blocking_send(ServerMessage::TransportStatus {
-                    status: RemoteTransportStatus::SshFallbackConnecting,
-                    detail: None,
-                })
-                .is_err()
-        {
-            return;
-        }
         attempt = attempt.saturating_add(1);
-        info!(
-            target = %config.target,
-            attempt,
-            "connecting remote SSH transport"
-        );
-        match run_one_ssh_session(config, Arc::clone(&router), &output, client_phase) {
-            SshExit::Detached => return,
-            SshExit::Reconnect(detail) => {
-                warn!(
+        let handshake = match connected.take() {
+            Some(handshake) => handshake,
+            None => {
+                if client_phase.is_connected()
+                    && output
+                        .blocking_send(ServerMessage::TransportStatus {
+                            status: RemoteTransportStatus::SshFallbackConnecting,
+                            detail: None,
+                        })
+                        .is_err()
+                {
+                    return;
+                }
+                info!(
                     target = %config.target,
                     attempt,
-                    reason = %detail,
-                    "remote SSH transport disconnected; reconnecting"
+                    "connecting remote SSH transport"
                 );
-                debug!(%detail, "remote SSH bridge disconnected; reconnecting");
-                thread::sleep(SSH_RECONNECT_DELAY);
+                match ssh_handshake(config, &router.hello(), &SshBridgeChild::default()) {
+                    Ok(handshake) => handshake,
+                    Err(SshExit::Detached) => return,
+                    Err(SshExit::Fatal(detail)) => {
+                        send_proxy_error(&output, client_phase, detail);
+                        return;
+                    }
+                    Err(SshExit::Reconnect(detail)) => {
+                        if !handle_ssh_failure(
+                            config,
+                            &mut retry,
+                            attempt,
+                            detail,
+                            &router,
+                            &output,
+                            client_phase,
+                            should_stop,
+                        ) {
+                            return;
+                        }
+                        continue;
+                    }
+                }
             }
+        };
+        let started = Instant::now();
+        match run_ssh_session(
+            config,
+            handshake,
+            Arc::clone(&router),
+            &output,
+            client_phase,
+        ) {
+            SshExit::Detached => return,
             SshExit::Fatal(detail) => {
                 send_proxy_error(&output, client_phase, detail);
                 return;
             }
+            SshExit::Reconnect(detail) => {
+                // A session that carried the UI for a while is progress, so it
+                // resets the backoff; a session that dies immediately keeps
+                // counting towards the give-up window.
+                if started.elapsed() >= SSH_SESSION_PROGRESS {
+                    retry.record_progress();
+                }
+                if !handle_ssh_failure(
+                    config,
+                    &mut retry,
+                    attempt,
+                    detail,
+                    &router,
+                    &output,
+                    client_phase,
+                    should_stop,
+                ) {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// Apply the reconnect backoff after a failed SSH attempt. Returns false when
+/// the loop must stop, either because the bridge kept failing past the
+/// give-up window or because the client went away while waiting.
+fn handle_ssh_failure(
+    config: &BridgeConfig,
+    retry: &mut SshRetryState,
+    attempt: u64,
+    detail: String,
+    router: &InputRouter,
+    output: &mpsc::Sender<ServerMessage>,
+    client_phase: &mut LocalClientPhase,
+    should_stop: &AtomicBool,
+) -> bool {
+    match retry.record_failure(Instant::now()) {
+        SshRetryDecision::GiveUp(failing_for) => {
+            warn!(
+                target = %config.target,
+                attempt,
+                reason = %detail,
+                failing_for_seconds = failing_for.as_secs(),
+                "remote SSH transport kept failing; giving up"
+            );
+            send_proxy_error(
+                output,
+                client_phase,
+                format!(
+                    "remote SSH bridge kept failing for {} minutes: {detail}",
+                    failing_for.as_secs() / 60
+                ),
+            );
+            false
+        }
+        SshRetryDecision::Wait(delay) => {
+            warn!(
+                target = %config.target,
+                attempt,
+                reason = %detail,
+                retry_in_seconds = delay.as_secs(),
+                "remote SSH transport disconnected; reconnecting"
+            );
+            sleep_interruptible(delay, router, should_stop)
         }
     }
 }
@@ -833,12 +1343,119 @@ enum SshExit {
     Fatal(String),
 }
 
-fn run_one_ssh_session(
+fn ssh_exit_detail(exit: &SshExit) -> &str {
+    match exit {
+        SshExit::Detached => "local client detached",
+        SshExit::Reconnect(detail) | SshExit::Fatal(detail) => detail,
+    }
+}
+
+/// Shared ownership of a spawned SSH bridge child process.
+///
+/// The first-attach race publishes its child here as soon as the process
+/// exists so the coordinator can kill it the moment QUIC wins: killing the
+/// child is the only way to unblock a worker that is already parked in the
+/// blocking welcome read. Every clone shares one slot, and the slot reaps
+/// whatever is left in it when the last clone drops, so a
+/// completed-but-unconsumed handshake (both race results queued) cannot leak
+/// a process either.
+#[derive(Clone, Default)]
+struct SshBridgeChild {
+    slot: Arc<Mutex<SshBridgeChildSlot>>,
+}
+
+#[derive(Default)]
+struct SshBridgeChildSlot {
+    child: Option<Child>,
+    cancelled: bool,
+}
+
+impl SshBridgeChild {
+    /// Publish a freshly spawned child. Returns false when the handle was
+    /// already cancelled; the child is killed and reaped here in that case
+    /// and the handshake must be abandoned.
+    fn publish(&self, child: Child) -> bool {
+        let mut slot = lock(&self.slot);
+        if slot.cancelled {
+            drop(slot);
+            reap_ssh_bridge_child(child);
+            return false;
+        }
+        slot.child = Some(child);
+        true
+    }
+
+    /// Hand the child to a caller that owns its lifetime from here on.
+    fn take(&self) -> Option<Child> {
+        lock(&self.slot).child.take()
+    }
+
+    /// Kill and reap the published child, and reject later publishes.
+    /// Idempotent: a repeated cancel, a winner that already took the child,
+    /// and the slot's own drop all become no-ops.
+    fn cancel(&self) -> Option<(u32, ExitStatus)> {
+        let child = {
+            let mut slot = lock(&self.slot);
+            slot.cancelled = true;
+            slot.child.take()?
+        };
+        reap_ssh_bridge_child(child)
+    }
+}
+
+impl Drop for SshBridgeChildSlot {
+    fn drop(&mut self) {
+        if let Some(child) = self.child.take() {
+            reap_ssh_bridge_child(child);
+        }
+    }
+}
+
+/// Kill a bridge child and wait for it, so no path leaves a zombie behind.
+fn reap_ssh_bridge_child(mut child: Child) -> Option<(u32, ExitStatus)> {
+    let pid = child.id();
+    let _ = child.kill();
+    match child.wait() {
+        Ok(status) => {
+            debug!(
+                child_pid = pid,
+                ?status,
+                "killed and reaped the SSH bridge process"
+            );
+            Some((pid, status))
+        }
+        Err(error) => {
+            warn!(
+                child_pid = pid,
+                %error,
+                "failed to reap the SSH bridge process"
+            );
+            None
+        }
+    }
+}
+
+/// A live SSH stdio bridge that finished its protocol handshake but has not
+/// started pumping messages yet, so the first-attach race can hand it over or
+/// throw it away.
+struct SshHandshake {
+    child: SshBridgeChild,
+    stdin: ChildStdin,
+    stdout: ChildStdout,
+    welcome: ServerMessage,
+}
+
+impl SshHandshake {
+    fn discard(self) {
+        self.child.cancel();
+    }
+}
+
+fn ssh_handshake(
     config: &BridgeConfig,
-    router: Arc<InputRouter>,
-    output: &mpsc::Sender<ServerMessage>,
-    client_phase: &mut LocalClientPhase,
-) -> SshExit {
+    hello: &HelloState,
+    child_handle: &SshBridgeChild,
+) -> Result<SshHandshake, SshExit> {
     let mut command = Command::new("ssh");
     apply_managed_ssh_options(&mut command, config.ssh_options.as_ref());
     command
@@ -853,57 +1470,88 @@ fn run_one_ssh_session(
         .stderr(Stdio::inherit());
     let mut child = match command.spawn() {
         Ok(child) => child,
-        Err(error) => return SshExit::Reconnect(format!("failed to start SSH bridge: {error}")),
+        Err(error) => {
+            return Err(SshExit::Reconnect(format!(
+                "failed to start SSH bridge: {error}"
+            )))
+        }
     };
     info!(
         target = %config.target,
         child_pid = child.id(),
         "remote SSH bridge process started"
     );
-    let mut child_stdin = match child.stdin.take() {
-        Some(stdin) => stdin,
-        None => {
-            let _ = child.kill();
-            let _ = child.wait();
-            return SshExit::Fatal("SSH bridge stdin is unavailable".to_owned());
-        }
+    let stdin = child.stdin.take();
+    let stdout = child.stdout.take();
+    // Publish before the blocking handshake I/O: from here on the race
+    // coordinator can kill this child to unblock and unwind this handshake.
+    if !child_handle.publish(child) {
+        return Err(SshExit::Reconnect(
+            "SSH bridge handshake was cancelled".to_owned(),
+        ));
+    }
+    let Some(mut stdin) = stdin else {
+        child_handle.cancel();
+        return Err(SshExit::Fatal("SSH bridge stdin is unavailable".to_owned()));
     };
-    let mut child_stdout = match child.stdout.take() {
-        Some(stdout) => stdout,
-        None => {
-            let _ = child.kill();
-            let _ = child.wait();
-            return SshExit::Fatal("SSH bridge stdout is unavailable".to_owned());
-        }
+    let Some(mut stdout) = stdout else {
+        child_handle.cancel();
+        return Err(SshExit::Fatal(
+            "SSH bridge stdout is unavailable".to_owned(),
+        ));
     };
 
-    let hello = router.hello();
-    if let Err(error) = crate::protocol::write_message(&mut child_stdin, &hello.message()) {
-        let _ = child.kill();
-        let _ = child.wait();
-        return SshExit::Reconnect(format!("failed to send SSH bridge hello: {error}"));
+    if let Err(error) = crate::protocol::write_message(&mut stdin, &hello.message()) {
+        child_handle.cancel();
+        return Err(SshExit::Reconnect(format!(
+            "failed to send SSH bridge hello: {error}"
+        )));
     }
-    let welcome: ServerMessage =
-        match crate::protocol::read_message(&mut child_stdout, MAX_FRAME_SIZE) {
-            Ok(welcome @ ServerMessage::Welcome { error: None, .. }) => welcome,
-            Ok(ServerMessage::Welcome {
-                error: Some(error), ..
-            }) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return SshExit::Fatal(error);
-            }
-            Ok(_) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return SshExit::Reconnect("SSH bridge sent an invalid welcome".to_owned());
-            }
-            Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return SshExit::Reconnect(format!("failed to read SSH bridge welcome: {error}"));
-            }
-        };
+    let welcome: ServerMessage = match crate::protocol::read_message(&mut stdout, MAX_FRAME_SIZE) {
+        Ok(welcome @ ServerMessage::Welcome { error: None, .. }) => welcome,
+        Ok(ServerMessage::Welcome {
+            error: Some(error), ..
+        }) => {
+            child_handle.cancel();
+            return Err(SshExit::Fatal(error));
+        }
+        Ok(_) => {
+            child_handle.cancel();
+            return Err(SshExit::Reconnect(
+                "SSH bridge sent an invalid welcome".to_owned(),
+            ));
+        }
+        Err(error) => {
+            child_handle.cancel();
+            return Err(SshExit::Reconnect(format!(
+                "failed to read SSH bridge welcome: {error}"
+            )));
+        }
+    };
+    Ok(SshHandshake {
+        child: child_handle.clone(),
+        stdin,
+        stdout,
+        welcome,
+    })
+}
+
+fn run_ssh_session(
+    config: &BridgeConfig,
+    handshake: SshHandshake,
+    router: Arc<InputRouter>,
+    output: &mpsc::Sender<ServerMessage>,
+    client_phase: &mut LocalClientPhase,
+) -> SshExit {
+    let SshHandshake {
+        child: child_handle,
+        mut stdin,
+        mut stdout,
+        welcome,
+    } = handshake;
+    let Some(mut child) = child_handle.take() else {
+        return SshExit::Reconnect("SSH bridge process was already reaped".to_owned());
+    };
     if !deliver_ssh_welcome(output, client_phase, welcome) {
         let _ = child.kill();
         let _ = child.wait();
@@ -919,7 +1567,7 @@ fn run_one_ssh_session(
     router.set_active(input_tx);
     let writer = thread::spawn(move || {
         while let Some(message) = input_rx.blocking_recv() {
-            if crate::protocol::write_message(&mut child_stdin, &message).is_err() {
+            if crate::protocol::write_message(&mut stdin, &message).is_err() {
                 break;
             }
             if matches!(message, ClientMessage::Detach) {
@@ -930,7 +1578,7 @@ fn run_one_ssh_session(
 
     let result = loop {
         match crate::protocol::read_message::<_, ServerMessage>(
-            &mut child_stdout,
+            &mut stdout,
             MAX_GRAPHICS_FRAME_SIZE,
         ) {
             Ok(ServerMessage::ClientDetached) => {
@@ -1295,5 +1943,332 @@ mod tests {
                 delay: QUIC_RECONNECT_BASE_DELAY,
             }
         );
+    }
+
+    #[test]
+    fn transport_machine_treats_a_superseded_session_as_terminal() {
+        // A newer generation of the same capability took over the session:
+        // the ladder must stop here instead of dialing fresh QUIC,
+        // rebootstrapping, or falling back to the SSH bridge, all of which
+        // would fence out the client that just replaced this one.
+        let (phase, action) = next_transport_phase(
+            TransportPhase::QuicLive(MAX_CONSECUTIVE_QUIC_RETRIES),
+            TransportEvent::SessionExited {
+                exit: SessionExit::Superseded("closed by peer: replaced".to_owned()),
+                stable: false,
+            },
+        );
+        assert_eq!(
+            phase,
+            TransportPhase::Done(QuicOutcome::Superseded(
+                "closed by peer: replaced".to_owned()
+            ))
+        );
+        assert_eq!(action, TransportAction::Finish);
+    }
+
+    #[test]
+    fn superseded_outcome_shuts_the_local_client_down_with_a_reason() {
+        let (output_tx, mut output_rx) = mpsc::channel::<ServerMessage>(2);
+        let mut phase = LocalClientPhase::Connected;
+        send_proxy_error(&output_tx, &mut phase, REMOTE_SESSION_SUPERSEDED.to_owned());
+        assert!(matches!(
+            output_rx.blocking_recv(),
+            Some(ServerMessage::ServerShutdown { reason: Some(reason) })
+                if reason == "another client took over this remote session"
+        ));
+    }
+
+    /// A reaped child leaves no `/proc` entry, while a killed-but-unwaited
+    /// child lingers there as a zombie. Returns `None` where `/proc` is not
+    /// available, so the assertions below simply do not apply.
+    fn proc_entry_exists(pid: u32) -> Option<bool> {
+        let proc = std::path::Path::new("/proc");
+        if !proc.exists() {
+            return None;
+        }
+        Some(proc.join(pid.to_string()).exists())
+    }
+
+    fn spawn_stand_in_ssh_child() -> Child {
+        Command::new("sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .spawn()
+            .expect("spawn a stand-in ssh bridge child")
+    }
+
+    #[test]
+    fn race_cancellation_kills_and_reaps_the_losing_ssh_child() {
+        let child_handle = SshBridgeChild::default();
+        let child = spawn_stand_in_ssh_child();
+        let pid = child.id();
+        assert!(child_handle.publish(child));
+        assert_ne!(proc_entry_exists(pid), Some(false));
+
+        // QUIC won after the bridge already spawned: cancelling kills the
+        // published child and waits for it, which unblocks the worker's
+        // blocking welcome read and leaves no zombie behind.
+        let (reaped_pid, status) = child_handle.cancel().expect("cancel reaps the child");
+        assert_eq!(reaped_pid, pid);
+        assert!(!status.success());
+        assert_ne!(proc_entry_exists(pid), Some(true));
+
+        // Idempotent: a second cancel (or a discard, or the slot's drop) has
+        // nothing left to kill.
+        assert!(child_handle.cancel().is_none());
+        assert!(child_handle.take().is_none());
+
+        // A worker that spawned ssh just after the race settled cannot leak
+        // it either: publishing on a cancelled handle reaps the child.
+        let late = spawn_stand_in_ssh_child();
+        let late_pid = late.id();
+        assert!(!child_handle.publish(late));
+        assert_ne!(proc_entry_exists(late_pid), Some(true));
+    }
+
+    #[test]
+    fn dropping_an_unconsumed_handshake_reaps_its_bridge_child() {
+        let child_handle = SshBridgeChild::default();
+        let queued = child_handle.clone();
+        let child = spawn_stand_in_ssh_child();
+        let pid = child.id();
+        assert!(child_handle.publish(child));
+
+        // The coordinator's handle goes away while the completed handshake is
+        // still queued: the child stays owned by the queued clone.
+        drop(child_handle);
+        assert_ne!(proc_entry_exists(pid), Some(false));
+
+        // Nobody consumed the handshake, so dropping it reaps the process
+        // instead of dropping a live `Child` on the floor.
+        drop(queued);
+        assert_ne!(proc_entry_exists(pid), Some(true));
+    }
+
+    #[test]
+    fn transport_machine_races_the_ssh_bridge_on_first_attach() {
+        // QUIC wins: the ladder continues exactly as an unraced first connect.
+        let (phase, action) =
+            next_transport_phase(TransportPhase::InitialRace, TransportEvent::QuicConnected);
+        assert_eq!(phase, TransportPhase::QuicLive(0));
+        assert_eq!(action, TransportAction::RunQuic { recovering: false });
+
+        // The SSH bridge wins: the QUIC ladder is done and the handed-over
+        // handshake carries the session.
+        let (phase, action) =
+            next_transport_phase(TransportPhase::InitialRace, TransportEvent::SshRaceWon);
+        assert_eq!(phase, TransportPhase::Done(QuicOutcome::SshRaceWon));
+        assert_eq!(action, TransportAction::Finish);
+
+        // Both raced transports failed: the SSH reconnect loop owns retrying.
+        let (phase, action) = next_transport_phase(
+            TransportPhase::InitialRace,
+            TransportEvent::QuicConnectFailed("QUIC: timed out; SSH bridge: no route".to_owned()),
+        );
+        assert_eq!(
+            phase,
+            TransportPhase::SshFallback("QUIC: timed out; SSH bridge: no route".to_owned())
+        );
+        assert_eq!(action, TransportAction::StartSshFallback);
+
+        // Detaching mid-race is terminal.
+        let (phase, action) =
+            next_transport_phase(TransportPhase::InitialRace, TransportEvent::ClientDetached);
+        assert_eq!(phase, TransportPhase::Done(QuicOutcome::Detached));
+        assert_eq!(action, TransportAction::Finish);
+    }
+
+    #[test]
+    fn quic_race_win_does_not_reenter_the_race_after_a_live_loss() {
+        // The ladder is one-way: a lost live QUIC session retries fresh QUIC,
+        // then rebootstraps, then hands over to SSH; it never races again.
+        let (phase, _) =
+            next_transport_phase(TransportPhase::InitialRace, TransportEvent::QuicConnected);
+        let (phase, action) = next_transport_phase(
+            phase,
+            TransportEvent::SessionExited {
+                exit: SessionExit::RetryFresh("path lost".to_owned()),
+                stable: false,
+            },
+        );
+        assert_eq!(phase, TransportPhase::QuicConnecting(QuicAttempt::Fresh(1)));
+        assert_eq!(
+            action,
+            TransportAction::ConnectQuic {
+                recovering: true,
+                detail: Some("path lost".to_owned()),
+                delay: QUIC_RECONNECT_BASE_DELAY,
+            }
+        );
+
+        let (phase, action) =
+            next_transport_phase(phase, TransportEvent::QuicConnectFailed("gone".to_owned()));
+        assert_eq!(phase, TransportPhase::SshRebootstrap);
+        assert_eq!(
+            action,
+            TransportAction::Rebootstrap {
+                detail: "gone".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn ssh_retry_decision_backs_off_exponentially_then_gives_up() {
+        let schedule = [(1, 1), (2, 2), (3, 4), (4, 8), (5, 16), (6, 30), (12, 30)];
+        for (failures, expected_seconds) in schedule {
+            assert_eq!(
+                ssh_retry_decision(failures, Duration::from_secs(60)),
+                SshRetryDecision::Wait(Duration::from_secs(expected_seconds)),
+                "failure {failures} should wait {expected_seconds}s"
+            );
+        }
+
+        // The give-up window ends the loop no matter how few attempts fit in it.
+        assert_eq!(
+            ssh_retry_decision(3, SSH_RECONNECT_GIVE_UP),
+            SshRetryDecision::GiveUp(SSH_RECONNECT_GIVE_UP)
+        );
+        assert_eq!(
+            ssh_retry_decision(500, Duration::from_secs(3_600)),
+            SshRetryDecision::GiveUp(Duration::from_secs(3_600))
+        );
+        // Just inside the window still retries.
+        assert!(matches!(
+            ssh_retry_decision(50, SSH_RECONNECT_GIVE_UP - Duration::from_secs(1)),
+            SshRetryDecision::Wait(_)
+        ));
+    }
+
+    #[test]
+    fn ssh_retry_state_gives_up_only_after_a_continuous_failure_window() {
+        let mut retry = SshRetryState::default();
+        let start = Instant::now();
+        assert_eq!(
+            retry.record_failure(start),
+            SshRetryDecision::Wait(SSH_RECONNECT_BASE_DELAY)
+        );
+        assert_eq!(
+            retry.record_failure(start + Duration::from_secs(1)),
+            SshRetryDecision::Wait(Duration::from_secs(2))
+        );
+
+        // A session that made progress resets both the delay and the window.
+        retry.record_progress();
+        assert_eq!(
+            retry.record_failure(start + SSH_RECONNECT_GIVE_UP),
+            SshRetryDecision::Wait(SSH_RECONNECT_BASE_DELAY)
+        );
+        assert!(matches!(
+            retry.record_failure(start + SSH_RECONNECT_GIVE_UP + SSH_RECONNECT_GIVE_UP),
+            SshRetryDecision::GiveUp(_)
+        ));
+    }
+
+    #[test]
+    fn interruptible_sleep_returns_early_when_the_client_detaches() {
+        let router = Arc::new(InputRouter::new(hello()));
+        let should_stop = AtomicBool::new(false);
+        let started = Instant::now();
+        assert!(sleep_interruptible(
+            Duration::from_millis(20),
+            &router,
+            &should_stop
+        ));
+
+        router.route(ClientMessage::Detach);
+        assert!(!sleep_interruptible(
+            Duration::from_secs(30),
+            &router,
+            &should_stop
+        ));
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    /// Two dead candidates each burn the full per-candidate QUIC connect
+    /// budget. Dialing them in parallel must cost about one budget, not two,
+    /// so a host with both an AAAA and an A record is not punished.
+    #[test]
+    fn quic_candidates_are_dialed_in_parallel() {
+        // Bound but never read: the handshake gets no response and times out.
+        let silent_ipv4 =
+            std::net::UdpSocket::bind("127.0.0.1:0").expect("bind silent ipv4 socket");
+        let silent_alias =
+            std::net::UdpSocket::bind("127.0.0.1:0").expect("bind silent alias socket");
+        let candidates = vec![
+            silent_ipv4.local_addr().expect("silent ipv4 addr"),
+            silent_alias.local_addr().expect("silent alias addr"),
+        ];
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let started = Instant::now();
+        let error = runtime
+            .block_on(dial_quic_candidates(QuicDial {
+                bootstrap: RemoteBootstrapRecord {
+                    version: PROTOCOL_VERSION,
+                    server_instance_id: [7u8; REMOTE_QUIC_ID_BYTES],
+                    port: candidates[0].port(),
+                    certificate_fingerprint: [9u8; crate::protocol::REMOTE_QUIC_HASH_BYTES],
+                    capability_token: [3u8; crate::protocol::REMOTE_QUIC_TOKEN_BYTES],
+                    expires_unix_seconds: u64::MAX,
+                    ssh_fallback_available: true,
+                },
+                candidates: candidates.clone(),
+                logical_client_id: [1u8; REMOTE_QUIC_ID_BYTES],
+                connection_generation: 1,
+                hello: hello(),
+                resource_cache: Arc::new(Mutex::new(ResourceCache::default())),
+            }))
+            .expect_err("silent candidates cannot complete a handshake");
+        let elapsed = started.elapsed();
+
+        for candidate in &candidates {
+            assert!(
+                error.contains(&candidate.to_string()),
+                "every candidate must be reported: {error}"
+            );
+        }
+        // Sequential dialing would need two full 2s budgets; parallel dialing
+        // needs one plus the stagger.
+        assert!(
+            elapsed < Duration::from_millis(3_500),
+            "parallel dial took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn quic_transport_never_uses_the_ssh_stream() {
+        // `quic` means QUIC only: no race, no fallback, ssh_fallback ignored.
+        for ssh_fallback in [true, false] {
+            let config = RemoteConfig {
+                transport: RemoteTransportConfig::Quic,
+                ssh_fallback,
+                ..Default::default()
+            };
+            assert!(!ssh_stream_allowed(&config));
+        }
+
+        // `auto` is the only mode ssh_fallback applies to.
+        assert!(ssh_stream_allowed(&RemoteConfig {
+            transport: RemoteTransportConfig::Auto,
+            ssh_fallback: true,
+            ..Default::default()
+        }));
+        assert!(!ssh_stream_allowed(&RemoteConfig {
+            transport: RemoteTransportConfig::Auto,
+            ssh_fallback: false,
+            ..Default::default()
+        }));
+
+        // `ssh` always uses the bridge, whatever ssh_fallback says.
+        assert!(ssh_stream_allowed(&RemoteConfig {
+            transport: RemoteTransportConfig::Ssh,
+            ssh_fallback: false,
+            ..Default::default()
+        }));
     }
 }

@@ -37,8 +37,9 @@ pub use self::{
     window_title::{WindowTitlePart, WindowTitleTemplate, WindowTitleToken},
 };
 
+pub use self::model::RemoteConfig;
 #[cfg(unix)]
-pub use self::model::{RemoteConfig, RemoteTransportConfig};
+pub use self::model::{RemoteTransportConfig, REMOTE_TRANSPORT_IDLE_TIMEOUT_MAX_SECONDS};
 
 pub(crate) use self::keybinds::parse_key_combo;
 pub(crate) use self::{

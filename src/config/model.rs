@@ -979,8 +979,12 @@ pub struct RemoteConfig {
     pub manage_ssh_config: bool,
     /// Inclusive unprivileged UDP port range used by the lazy QUIC listener.
     pub quic_port_range: String,
-    /// QUIC idle lifetime. Default: 86400 seconds.
+    /// How long an SSH-minted QUIC credential stays valid for fresh
+    /// reconnects without re-running SSH. Default: 86400 seconds.
     pub quic_idle_timeout_seconds: u64,
+    /// How long a silent QUIC connection is kept before the server declares
+    /// it dead. Default: 45 seconds.
+    pub quic_transport_idle_timeout_seconds: u64,
     /// Fall back to the SSH stdio bridge when QUIC is unavailable.
     pub ssh_fallback: bool,
 }
@@ -992,8 +996,32 @@ impl Default for RemoteConfig {
             manage_ssh_config: true,
             quic_port_range: "48000-48100".to_owned(),
             quic_idle_timeout_seconds: 86_400,
+            quic_transport_idle_timeout_seconds: 45,
             ssh_fallback: true,
         }
+    }
+}
+
+/// Smallest and largest accepted `remote.quic_transport_idle_timeout_seconds`.
+///
+/// Below 10s a normal stall on a mobile path would tear the connection down
+/// faster than the client can probe it; above 600s a dead peer would hold
+/// server-side state for ten minutes.
+#[cfg(unix)]
+pub const REMOTE_TRANSPORT_IDLE_TIMEOUT_MIN_SECONDS: u64 = 10;
+#[cfg(unix)]
+pub const REMOTE_TRANSPORT_IDLE_TIMEOUT_MAX_SECONDS: u64 = 600;
+
+#[cfg(unix)]
+impl RemoteConfig {
+    /// Validate `remote.quic_transport_idle_timeout_seconds`, clamping an
+    /// out-of-range value into the supported window instead of letting a
+    /// typo produce a transport that never times out or dies instantly.
+    pub fn validated_transport_idle_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.quic_transport_idle_timeout_seconds.clamp(
+            REMOTE_TRANSPORT_IDLE_TIMEOUT_MIN_SECONDS,
+            REMOTE_TRANSPORT_IDLE_TIMEOUT_MAX_SECONDS,
+        ))
     }
 }
 
@@ -1919,6 +1947,38 @@ headless_rows = 50
             config.advanced.scrollback_limit_bytes,
             DEFAULT_SCROLLBACK_LIMIT_BYTES
         );
+    }
+
+    #[test]
+    fn remote_transport_idle_timeout_defaults_and_clamps() {
+        let config = Config::default();
+        assert_eq!(config.remote.quic_transport_idle_timeout_seconds, 45);
+        assert_eq!(config.remote.quic_idle_timeout_seconds, 86_400);
+        assert_eq!(
+            config.remote.validated_transport_idle_timeout(),
+            std::time::Duration::from_secs(45)
+        );
+
+        let toml = r#"
+[remote]
+quic_transport_idle_timeout_seconds = 120
+"#;
+        let parsed: Config = toml::from_str(toml).unwrap();
+        assert_eq!(
+            parsed.remote.validated_transport_idle_timeout(),
+            std::time::Duration::from_secs(120)
+        );
+
+        for (configured, expected) in [(0, 10), (5, 10), (100_000, 600)] {
+            let remote = RemoteConfig {
+                quic_transport_idle_timeout_seconds: configured,
+                ..Default::default()
+            };
+            assert_eq!(
+                remote.validated_transport_idle_timeout(),
+                std::time::Duration::from_secs(expected)
+            );
+        }
     }
 
     #[test]

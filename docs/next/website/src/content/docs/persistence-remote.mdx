@@ -48,7 +48,9 @@ In this mode, your local Herdr is a thin client. It connects over SSH, starts or
 
 The default `auto` transport uses SSH to authenticate, start the remote server, and obtain a short-lived capability plus a pinned certificate fingerprint. It then streams control and terminal updates over QUIC. The remote server opens its UDP listener lazily only after this authenticated bootstrap. Allow inbound UDP ports `48000-48100` on the remote host, or set a different inclusive range with `remote.quic_port_range`.
 
-If the UDP path stalls, Herdr keeps the remote pane processes running, shows a recovery screen locally, discards pane input while the display is stale, and tries QUIC path recovery, a fresh QUIC connection, and SSH rebootstrap in order. With the default `remote.ssh_fallback = true`, an unreachable UDP endpoint falls back to the SSH stdio bridge without requiring a manual reattach. A recovered transport always starts with a complete redraw; interrupted Kitty graphics resources are content-addressed and reconstructed before the frame becomes visible.
+On the first attach with `transport = "auto"`, Herdr dials every resolved address of the remote host at once and, after a short QUIC head start, races the SSH stdio bridge against the QUIC handshake. Whichever transport finishes its handshake first is used and the loser is torn down, so a host that blocks UDP is never slower to attach than the plain SSH bridge.
+
+If the UDP path stalls, Herdr keeps the remote pane processes running, shows a recovery screen locally, discards pane input while the display is stale, and tries QUIC path recovery, a fresh QUIC connection, and SSH rebootstrap in order. With the default `remote.ssh_fallback = true`, an unreachable UDP endpoint falls back to the SSH stdio bridge without requiring a manual reattach. The fallback ladder is one-way for a live session: once the SSH bridge takes over, Herdr stays on it until you reattach, instead of flapping between transports. A recovered transport always starts with a complete redraw; interrupted Kitty graphics resources are content-addressed and reconstructed before the frame becomes visible. If the SSH bridge itself keeps failing, reconnects back off from 1 second to 30 seconds and Herdr exits with the underlying SSH error after 10 minutes of continuous failure.
 
 By default, `herdr --remote` uses your local Herdr keybindings for that attach. This keeps local muscle memory even when the remote server has different config. The local keybindings are a snapshot from attach time; detach and reattach after editing local keybindings. Use `--remote-keybindings server` when you want the remote server config instead. Local custom command keybindings are not sent, because those commands would run on the remote host.
 
@@ -75,14 +77,17 @@ Choose the transport in `config.toml`:
 
 ```toml
 [remote]
-transport = "auto"              # auto, quic, or ssh
+transport = "auto"                        # auto, quic, or ssh
 quic_port_range = "48000-48100"
 quic_idle_timeout_seconds = 86400
+quic_transport_idle_timeout_seconds = 45
 ssh_fallback = true
 manage_ssh_config = true
 ```
 
-Use `transport = "ssh"` when the remote host cannot accept UDP. Use `transport = "quic"` with `ssh_fallback = false` when QUIC is required and failure should be explicit instead of falling back.
+The two QUIC timeouts control different things. `quic_transport_idle_timeout_seconds` is the transport idle timeout: how long a silent connection is kept before the server declares it dead (default 45 seconds, accepted range 10-600). `quic_idle_timeout_seconds` is the lifetime of the SSH-minted credential: how long Herdr can open a fresh QUIC connection after a sleep or network change without re-running SSH (default 86400 seconds, one day).
+
+Use `transport = "ssh"` when the remote host cannot accept UDP. Use `transport = "quic"` when QUIC is required and failure should be explicit: that mode never uses the SSH stream, so it does not race or fall back to the stdio bridge and reports an error instead. `ssh_fallback` therefore only applies to `transport = "auto"`. Both `auto` and `quic` still use SSH to authenticate, start the remote server, and mint QUIC credentials.
 
 Remote attach uses your normal OpenSSH authentication. If the target uses a passphrase-protected key in a non-interactive shell, script, CI job, or mobile terminal that cannot show the passphrase prompt, load the key into ssh-agent first:
 
