@@ -468,6 +468,12 @@ fn spawn_windows_client_accept_thread(
         }
     });
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RenderSendError {
+    Oversized,
+    Full,
+    Disconnected,
+}
 
 impl HeadlessServer {
     /// Creates and starts the headless server.
@@ -2706,28 +2712,26 @@ impl HeadlessServer {
             }
         };
 
-        let mut broken_clients: Vec<u64> = Vec::new();
-        for (&client_id, client) in &mut self.clients {
-            if let Some(writer) = &client.writer {
-                if writer.control.send(serialized.clone()).is_err() {
-                    debug!(client_id, "client writer channel closed during broadcast");
-                    broken_clients.push(client_id);
-                }
-            }
-        }
-
-        // Remove broken clients.
-        for client_id in broken_clients {
-            self.remove_client_and_resize_if_needed(client_id);
+        let broken: Vec<u64> = self
+            .clients
+            .iter()
+            .filter_map(|(&id, c)| {
+                c.writer
+                    .as_ref()?
+                    .control
+                    .send(serialized.clone())
+                    .err()
+                    .map(|_| id)
+            })
+            .collect();
+        for id in broken {
+            self.remove_client_and_resize_if_needed(id);
         }
     }
 
-    /// Sends a client-local side effect to the foreground client only.
     fn send_to_foreground_client(&mut self, msg: ServerMessage) -> bool {
-        let Some(client_id) = self.foreground_client_id else {
-            return false;
-        };
-        self.send_to_client(client_id, msg)
+        self.foreground_client_id
+            .is_some_and(|client_id| self.send_to_client(client_id, msg))
     }
 
     /// Sends a message to a specific client. Returns false if the client
@@ -2741,21 +2745,20 @@ impl HeadlessServer {
             }
         };
 
-        if let Some(client) = self.clients.get(&client_id) {
-            if let Some(writer) = &client.writer {
-                if writer.control.send(serialized).is_err() {
-                    debug!(
-                        client_id,
-                        "client writer channel closed during targeted send"
-                    );
-                    self.remove_client_and_resize_if_needed(client_id);
-                    return false;
-                }
+        let Some(client) = self.clients.get(&client_id) else {
+            return false;
+        };
+        if let Some(writer) = &client.writer {
+            if writer.control.send(serialized).is_err() {
+                debug!(
+                    client_id,
+                    "client writer channel closed during targeted send"
+                );
+                self.remove_client_and_resize_if_needed(client_id);
+                return false;
             }
-            true
-        } else {
-            false
         }
+        true
     }
 
     fn shutdown_terminal_stream_clients(&mut self, terminal_id: &str, reason: String) {
@@ -4407,6 +4410,65 @@ impl HeadlessServer {
             && !self.app.full_redraw_pending
     }
 
+    fn send_prepared_render(
+        writer: &crate::server::client_transport::ClientWriter,
+        prepared: &mut crate::server::render_stream::PreparedRender,
+        max: usize,
+    ) -> Result<(), RenderSendError> {
+        if writer.render.is_structured() {
+            if let Some(frame) = prepared.take_terminal_frame() {
+                let has_graphics = max > crate::protocol::MAX_FRAME_SIZE;
+                let headroom = crate::remote::quic_policy::max_record_headroom(has_graphics);
+                if frame.bytes.len() > max.saturating_sub(headroom) {
+                    return Err(RenderSendError::Oversized);
+                }
+                return writer.render.try_send_frame(frame).map_err(|e| match e {
+                    std::sync::mpsc::TrySendError::Disconnected(_) => RenderSendError::Disconnected,
+                    _ => RenderSendError::Full,
+                });
+            }
+        }
+        match Self::frame_server_message_with_max(prepared.message(), max) {
+            Ok(serialized) => {
+                crate::render_prof::counter("retained_send.bytes", serialized.len() as u64);
+                writer.render.try_send(serialized).map_err(|e| match e {
+                    std::sync::mpsc::TrySendError::Disconnected(_) => RenderSendError::Disconnected,
+                    _ => RenderSendError::Full,
+                })
+            }
+            Err(protocol::FramingError::Oversized { .. }) => Err(RenderSendError::Oversized),
+            Err(_) => Err(RenderSendError::Full),
+        }
+    }
+    fn handle_render_send_result(
+        client: &mut ClientConnection,
+        client_id: u64,
+        prepared: crate::server::render_stream::PreparedRender,
+        sent: Result<(), RenderSendError>,
+        broken_clients: &mut Vec<u64>,
+    ) -> bool {
+        match sent {
+            Ok(()) => {
+                client.clear_deferred_render();
+                client.render_state.commit_sent_frame(prepared);
+                true
+            }
+            Err(RenderSendError::Full) => {
+                client.defer_full_render();
+                false
+            }
+            Err(RenderSendError::Disconnected) => {
+                debug!(client_id, "client writer channel closed, marking as broken");
+                broken_clients.push(client_id);
+                false
+            }
+            Err(RenderSendError::Oversized) => {
+                warn!(client_id, "skipping oversized frame for client");
+                false
+            }
+        }
+    }
+
     fn send_retained_frame_to_client(
         &mut self,
         client_id: u64,
@@ -4422,65 +4484,18 @@ impl HeadlessServer {
             return false;
         };
         let prepare_started = crate::render_prof::timer();
-        let Some(prepared) = client.render_state.prepare_frame(frame) else {
+        let Some(mut prepared) = client.render_state.prepare_frame(frame) else {
             client.clear_deferred_render();
             crate::render_prof::event("retained_send.skip_identical");
             crate::render_prof::duration_since("retained_send.prepare_frame", prepare_started);
             return true;
         };
         crate::render_prof::duration_since("retained_send.prepare_frame", prepare_started);
-        let serialize_started = crate::render_prof::timer();
-        let serialized = match Self::frame_server_message(prepared.message()) {
-            Ok(framed) => {
-                crate::render_prof::duration_since("retained_send.serialize", serialize_started);
-                framed
-            }
-            Err(protocol::FramingError::Oversized { claimed, max }) => {
-                warn!(
-                    client_id,
-                    claimed, max, "skipping oversized retained frame for client"
-                );
-                crate::render_prof::event("retained_send_fallback.serialize_oversized");
-                crate::render_prof::duration_since("retained_send.serialize", serialize_started);
-                return false;
-            }
-            Err(err) => {
-                warn!(client_id, err = %err, "failed to serialize retained frame for client");
-                broken_clients.push(client_id);
-                crate::render_prof::event("retained_send_fallback.serialize_error");
-                crate::render_prof::duration_since("retained_send.serialize", serialize_started);
-                return false;
-            }
-        };
-        crate::render_prof::counter("retained_send.bytes", serialized.len() as u64);
-
         let send_started = crate::render_prof::timer();
-        match writer.render.try_send(serialized) {
-            Ok(()) => {
-                client.clear_deferred_render();
-                client.render_state.commit_sent_frame(prepared);
-                crate::render_prof::event("retained_send.sent");
-                crate::render_prof::duration_since("retained_send.try_send", send_started);
-                true
-            }
-            Err(std::sync::mpsc::TrySendError::Full(_)) => {
-                client.defer_full_render();
-                crate::render_prof::event("retained_send_fallback.queue_full");
-                crate::render_prof::duration_since("retained_send.try_send", send_started);
-                debug!(
-                    client_id,
-                    "render queue full, deferring latest retained frame"
-                );
-                false
-            }
-            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
-                debug!(client_id, "client writer channel closed, marking as broken");
-                broken_clients.push(client_id);
-                crate::render_prof::event("retained_send_fallback.writer_disconnected");
-                crate::render_prof::duration_since("retained_send.try_send", send_started);
-                false
-            }
-        }
+        let sent =
+            Self::send_prepared_render(&writer, &mut prepared, crate::protocol::MAX_FRAME_SIZE);
+        crate::render_prof::duration_since("retained_send.try_send", send_started);
+        Self::handle_render_send_result(client, client_id, prepared, sent, broken_clients)
     }
 
     fn render_and_stream(&mut self) {
@@ -4681,76 +4696,50 @@ impl HeadlessServer {
             } else {
                 crate::protocol::MAX_FRAME_SIZE
             };
-            let serialized = match Self::frame_server_message_with_max(prepared.message(), max) {
-                Ok(frame) => frame,
-                Err(protocol::FramingError::Oversized { claimed, max }) if has_graphics => {
-                    warn!(
-                        client_id,
-                        claimed, max, "dropping graphics from oversized frame for client"
-                    );
-                    let Some(mut text_only_frame) = prepared.into_frame() else {
-                        crate::render_prof::event("full_render.serialize_error");
-                        continue;
-                    };
-                    text_only_frame.graphics.clear();
-                    let Some(text_only_prepared) =
-                        client.render_state.prepare_frame(text_only_frame)
-                    else {
-                        client.clear_deferred_render();
-                        crate::render_prof::event("full_render.skip_identical_text_only");
-                        continue;
-                    };
-                    let framed = match Self::frame_server_message(text_only_prepared.message()) {
-                        Ok(framed) => framed,
-                        Err(err) => {
-                            warn!(client_id, err = %err, "failed to serialize text-only frame for client");
-                            broken_clients.push(client_id);
-                            crate::render_prof::event("full_render.serialize_error");
-                            continue;
-                        }
-                    };
-                    prepared = text_only_prepared;
-                    commit_graphics_cache = false;
-                    encoded.incomplete = false;
-                    framed
-                }
-                Err(protocol::FramingError::Oversized { claimed, max }) => {
-                    warn!(
-                        client_id,
-                        claimed, max, "skipping oversized frame for client"
-                    );
-                    crate::render_prof::event("full_render.serialize_oversized");
+            let mut sent = Self::send_prepared_render(&writer, &mut prepared, max);
+            if matches!(sent, Err(RenderSendError::Oversized)) && has_graphics {
+                warn!(
+                    client_id,
+                    max, "dropping graphics from oversized frame for client"
+                );
+                let Some(mut text_only_frame) = prepared.into_frame() else {
                     continue;
-                }
-                Err(err) => {
-                    warn!(client_id, err = %err, "failed to serialize frame");
-                    broken_clients.push(client_id);
-                    crate::render_prof::event("full_render.serialize_error");
+                };
+                text_only_frame.graphics.clear();
+                let Some(mut text_only_prepared) =
+                    client.render_state.prepare_frame(text_only_frame)
+                else {
+                    client.clear_deferred_render();
                     continue;
+                };
+                sent = Self::send_prepared_render(
+                    &writer,
+                    &mut text_only_prepared,
+                    crate::protocol::MAX_FRAME_SIZE,
+                );
+                prepared = text_only_prepared;
+                commit_graphics_cache = false;
+                encoded.incomplete = false;
+            }
+            let ok = Self::handle_render_send_result(
+                client,
+                client_id,
+                prepared,
+                sent,
+                &mut broken_clients,
+            );
+            if ok {
+                if commit_graphics_cache {
+                    client.graphics_cache = next_graphics_cache;
+                    client.graphics_surface_reset_pending = false;
                 }
-            };
-            match writer.render.try_send(serialized) {
-                Ok(()) => {
-                    if commit_graphics_cache {
-                        client.graphics_cache = next_graphics_cache;
-                        client.graphics_surface_reset_pending = false;
-                    }
-                    client.render_state.commit_sent_frame(prepared);
-                    if encoded.incomplete {
-                        client.defer_full_render();
-                        deferred_frame = true;
-                    } else {
-                        client.clear_deferred_render();
-                    }
-                    crate::render_prof::event("full_render.sent");
-                }
-                Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                if encoded.incomplete {
                     client.defer_full_render();
                     deferred_frame = true;
                 }
-                Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
-                    broken_clients.push(client_id);
-                }
+                crate::render_prof::event("full_render.sent");
+            } else if matches!(sent, Err(RenderSendError::Full)) {
+                deferred_frame = true;
             }
         }
 

@@ -176,7 +176,7 @@ pub(crate) struct ClientControlWriter {
     target: ClientControlTarget,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 enum ClientControlTarget {
     Queue(Arc<ClientWriterQueue>),
     #[cfg(unix)]
@@ -190,7 +190,7 @@ pub(crate) struct ClientRenderWriter {
     test_render: Option<std::sync::mpsc::SyncSender<Vec<u8>>>,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 enum ClientRenderTarget {
     Queue(Arc<ClientWriterQueue>),
     #[cfg(unix)]
@@ -200,16 +200,12 @@ enum ClientRenderTarget {
 impl Clone for ClientControlWriter {
     fn clone(&self) -> Self {
         match &self.target {
-            ClientControlTarget::Queue(queue) => {
-                queue.add_sender();
-                Self {
-                    target: ClientControlTarget::Queue(queue.clone()),
-                }
-            }
+            ClientControlTarget::Queue(queue) => queue.add_sender(),
             #[cfg(unix)]
-            ClientControlTarget::Quic(sender) => Self {
-                target: ClientControlTarget::Quic(sender.clone()),
-            },
+            ClientControlTarget::Quic(_) => {}
+        }
+        Self {
+            target: self.target.clone(),
         }
     }
 }
@@ -244,20 +240,14 @@ impl ClientControlWriter {
 impl Clone for ClientRenderWriter {
     fn clone(&self) -> Self {
         match &self.target {
-            ClientRenderTarget::Queue(queue) => {
-                queue.add_sender();
-                Self {
-                    target: ClientRenderTarget::Queue(queue.clone()),
-                    #[cfg(test)]
-                    test_render: self.test_render.clone(),
-                }
-            }
+            ClientRenderTarget::Queue(queue) => queue.add_sender(),
             #[cfg(unix)]
-            ClientRenderTarget::Quic(sender) => Self {
-                target: ClientRenderTarget::Quic(sender.clone()),
-                #[cfg(test)]
-                test_render: self.test_render.clone(),
-            },
+            ClientRenderTarget::Quic(_) => {}
+        }
+        Self {
+            target: self.target.clone(),
+            #[cfg(test)]
+            test_render: self.test_render.clone(),
         }
     }
 }
@@ -292,6 +282,26 @@ impl ClientRenderWriter {
             #[cfg(unix)]
             ClientRenderTarget::Quic(sender) => sender.try_send(data),
         }
+    }
+    pub(crate) fn is_structured(&self) -> bool {
+        #[cfg(unix)]
+        return matches!(&self.target, ClientRenderTarget::Quic(_));
+        #[cfg(not(unix))]
+        false
+    }
+
+    pub(crate) fn try_send_frame(
+        &self,
+        _frame: crate::protocol::TerminalFrame,
+    ) -> Result<(), TrySendError<Vec<u8>>> {
+        #[cfg(unix)]
+        if let ClientRenderTarget::Quic(sender) = &self.target {
+            return sender.try_send_frame(_frame).map_err(|e| match e {
+                TrySendError::Full(_) => TrySendError::Full(Vec::new()),
+                TrySendError::Disconnected(_) => TrySendError::Disconnected(Vec::new()),
+            });
+        }
+        Err(TrySendError::Full(Vec::new()))
     }
 
     pub(crate) fn send_ordered(&self, data: Vec<u8>) -> Result<(), TrySendError<Vec<u8>>> {

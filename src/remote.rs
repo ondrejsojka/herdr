@@ -8,7 +8,6 @@ pub(crate) mod frame;
 #[cfg(unix)]
 mod quic;
 
-#[cfg(unix)]
 pub(crate) mod quic_policy;
 
 #[cfg(unix)]

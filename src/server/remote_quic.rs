@@ -10,18 +10,20 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use quinn::{Connection, Endpoint, RecvStream, SendStream, VarInt};
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::sync::{mpsc, watch, Notify, Semaphore};
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use crate::config::RemoteConfig;
 use crate::protocol::{
     self, ClientLaunchMode, ClientMessage, RemoteBootstrapRecord, RemoteBootstrapRequest,
     RemoteQuicHello, RemoteQuicRenderRecord, RemoteQuicResourceRef, RemoteQuicStreamHeader,
-    RenderEncoding, ServerMessage, MAX_FRAME_SIZE, MAX_GRAPHICS_FRAME_SIZE, PROTOCOL_VERSION,
-    REMOTE_QUIC_ALPN, REMOTE_QUIC_HASH_BYTES, REMOTE_QUIC_ID_BYTES,
+    RenderEncoding, ServerMessage, TerminalFrame, MAX_FRAME_SIZE, MAX_GRAPHICS_FRAME_SIZE,
+    PROTOCOL_VERSION, REMOTE_QUIC_ALPN, REMOTE_QUIC_HASH_BYTES, REMOTE_QUIC_ID_BYTES,
     REMOTE_QUIC_MAX_RESOURCE_INVENTORY, REMOTE_QUIC_MAX_RESOURCE_SIZE, REMOTE_QUIC_TOKEN_BYTES,
 };
 use crate::remote::frame::{hash_bytes, lock, read_async_message, write_async_message};
-use crate::remote::quic_policy::{PRIORITY_CONTROL, PRIORITY_RENDER, PRIORITY_RESOURCE};
+use crate::remote::quic_policy::{
+    MAX_RESOURCE_REFS_PER_FRAME, PRIORITY_CONTROL, PRIORITY_RENDER, PRIORITY_RESOURCE,
+};
 
 use crate::server::client_transport::{
     clamp_terminal_size, client_message_to_event, parse_client_keybindings, ClientWriter,
@@ -32,7 +34,6 @@ const MAX_TOKENS: usize = 64;
 const MAX_CONTROL_ITEMS: usize = 64;
 const MAX_CONTROL_BYTES: usize = 1024 * 1024;
 const MAX_RESOURCE_TRANSFERS: usize = 2;
-const MAX_RESOURCE_REFS_PER_FRAME: usize = 1024;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const TOKEN_MIN_LIFETIME: Duration = Duration::from_secs(60);
 const TOKEN_MAX_LIFETIME: Duration = Duration::from_secs(7 * 24 * 60 * 60);
@@ -627,19 +628,25 @@ struct BoundedControlQueue {
     ready: Notify,
 }
 
+struct QueuedControl {
+    data: Vec<u8>,
+    key: Option<u8>,
+    drop_on_overflow: bool,
+}
+
 #[derive(Default)]
 struct ControlQueueState {
-    items: VecDeque<Vec<u8>>,
+    items: VecDeque<QueuedControl>,
     bytes: usize,
     closed: bool,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ControlKey {
-    WindowTitle,
-    MouseCapture,
-    PrefixInputSource,
-    ReloadConfig,
+impl ControlQueueState {
+    fn remove_at(&mut self, index: usize) {
+        if let Some(removed) = self.items.remove(index) {
+            self.bytes = self.bytes.saturating_sub(removed.data.len());
+        }
+    }
 }
 
 impl BoundedControlQueue {
@@ -648,45 +655,50 @@ impl BoundedControlQueue {
         if state.closed {
             return Err(std::sync::mpsc::SendError(data));
         }
-        let policy = control_policy(&data);
+        let (key, drop_on_overflow) = match protocol::read_message::<_, ServerMessage>(
+            &mut data.as_slice(),
+            MAX_GRAPHICS_FRAME_SIZE,
+        ) {
+            Ok(ServerMessage::WindowTitle { .. }) => (Some(1), false),
+            Ok(ServerMessage::MouseCapture { .. }) => (Some(2), false),
+            Ok(ServerMessage::PrefixInputSource { .. }) => (Some(3), false),
+            Ok(ServerMessage::ReloadSoundConfig) => (Some(4), false),
+            Ok(
+                ServerMessage::Notify { .. }
+                | ServerMessage::Clipboard { .. }
+                | ServerMessage::OpenUrl { .. },
+            ) => (None, true),
+            _ => (None, false),
+        };
         if data.len() > MAX_CONTROL_BYTES {
-            return if policy.drop_on_overflow {
+            return if drop_on_overflow {
                 Ok(())
             } else {
                 Err(std::sync::mpsc::SendError(data))
             };
         }
-        if let Some(key) = policy.key {
-            if let Some(index) = state
-                .items
-                .iter()
-                .position(|queued| control_policy(queued).key == Some(key))
-            {
-                if let Some(removed) = state.items.remove(index) {
-                    state.bytes = state.bytes.saturating_sub(removed.len());
-                }
+        if let Some(k) = key {
+            if let Some(i) = state.items.iter().position(|q| q.key == Some(k)) {
+                state.remove_at(i);
             }
         }
-
         while state.items.len() >= MAX_CONTROL_ITEMS
             || state.bytes.saturating_add(data.len()) > MAX_CONTROL_BYTES
         {
-            if policy.drop_on_overflow {
+            if drop_on_overflow {
                 return Ok(());
             }
-            let Some(index) = state
-                .items
-                .iter()
-                .position(|queued| control_policy(queued).drop_on_overflow)
-            else {
+            let Some(i) = state.items.iter().position(|q| q.drop_on_overflow) else {
                 return Err(std::sync::mpsc::SendError(data));
             };
-            if let Some(removed) = state.items.remove(index) {
-                state.bytes = state.bytes.saturating_sub(removed.len());
-            }
+            state.remove_at(i);
         }
         state.bytes = state.bytes.saturating_add(data.len());
-        state.items.push_back(data);
+        state.items.push_back(QueuedControl {
+            data,
+            key,
+            drop_on_overflow,
+        });
         drop(state);
         self.ready.notify_one();
         Ok(())
@@ -697,9 +709,9 @@ impl BoundedControlQueue {
             let notified = self.ready.notified();
             {
                 let mut state = lock(&self.state);
-                if let Some(data) = state.items.pop_front() {
-                    state.bytes = state.bytes.saturating_sub(data.len());
-                    return Some(data);
+                if let Some(item) = state.items.pop_front() {
+                    state.bytes = state.bytes.saturating_sub(item.data.len());
+                    return Some(item.data);
                 }
                 if state.closed {
                     return None;
@@ -721,46 +733,6 @@ impl BoundedControlQueue {
     }
 }
 
-struct ControlPolicy {
-    key: Option<ControlKey>,
-    drop_on_overflow: bool,
-}
-
-fn control_policy(data: &[u8]) -> ControlPolicy {
-    let mut input = data;
-    let message = protocol::read_message::<_, ServerMessage>(&mut input, MAX_GRAPHICS_FRAME_SIZE);
-    match message {
-        Ok(ServerMessage::WindowTitle { .. }) => ControlPolicy {
-            key: Some(ControlKey::WindowTitle),
-            drop_on_overflow: false,
-        },
-        Ok(ServerMessage::MouseCapture { .. }) => ControlPolicy {
-            key: Some(ControlKey::MouseCapture),
-            drop_on_overflow: false,
-        },
-        Ok(ServerMessage::PrefixInputSource { .. }) => ControlPolicy {
-            key: Some(ControlKey::PrefixInputSource),
-            drop_on_overflow: false,
-        },
-        Ok(ServerMessage::ReloadSoundConfig) => ControlPolicy {
-            key: Some(ControlKey::ReloadConfig),
-            drop_on_overflow: false,
-        },
-        Ok(
-            ServerMessage::Notify { .. }
-            | ServerMessage::Clipboard { .. }
-            | ServerMessage::OpenUrl { .. },
-        ) => ControlPolicy {
-            key: None,
-            drop_on_overflow: true,
-        },
-        _ => ControlPolicy {
-            key: None,
-            drop_on_overflow: false,
-        },
-    }
-}
-
 #[derive(Clone)]
 pub(crate) struct QuicRenderSender {
     inner: Arc<QuicRenderSenderInner>,
@@ -775,14 +747,18 @@ impl std::fmt::Debug for QuicRenderSender {
 }
 
 struct QuicRenderSenderInner {
-    tx: mpsc::UnboundedSender<Vec<u8>>,
+    tx: mpsc::UnboundedSender<TerminalFrame>,
     busy: AtomicBool,
     generation: AtomicU64,
     generation_tx: watch::Sender<u64>,
 }
 
 impl QuicRenderSender {
-    fn new() -> (Self, mpsc::UnboundedReceiver<Vec<u8>>, watch::Receiver<u64>) {
+    fn new() -> (
+        Self,
+        mpsc::UnboundedReceiver<TerminalFrame>,
+        watch::Receiver<u64>,
+    ) {
         let (tx, rx) = mpsc::unbounded_channel();
         let (generation_tx, generation_rx) = watch::channel(1);
         (
@@ -799,23 +775,45 @@ impl QuicRenderSender {
         )
     }
 
-    pub(crate) fn try_send(
+    pub(crate) fn try_send_frame(
         &self,
-        data: Vec<u8>,
-    ) -> Result<(), std::sync::mpsc::TrySendError<Vec<u8>>> {
+        frame: TerminalFrame,
+    ) -> Result<(), std::sync::mpsc::TrySendError<TerminalFrame>> {
         if self
             .inner
             .busy
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_err()
         {
-            return Err(std::sync::mpsc::TrySendError::Full(data));
+            return Err(std::sync::mpsc::TrySendError::Full(frame));
         }
-        if let Err(err) = self.inner.tx.send(data) {
+        if let Err(err) = self.inner.tx.send(frame) {
             self.inner.busy.store(false, Ordering::Release);
             return Err(std::sync::mpsc::TrySendError::Disconnected(err.0));
         }
         Ok(())
+    }
+
+    pub(crate) fn try_send(
+        &self,
+        data: Vec<u8>,
+    ) -> Result<(), std::sync::mpsc::TrySendError<Vec<u8>>> {
+        let mut input = data.as_slice();
+        if let Ok(ServerMessage::Terminal(frame)) =
+            protocol::read_message::<_, ServerMessage>(&mut input, MAX_GRAPHICS_FRAME_SIZE)
+        {
+            return self.try_send_frame(frame).map_err(|e| match e {
+                std::sync::mpsc::TrySendError::Full(_) => std::sync::mpsc::TrySendError::Full(data),
+                std::sync::mpsc::TrySendError::Disconnected(_) => {
+                    std::sync::mpsc::TrySendError::Disconnected(data)
+                }
+            });
+        }
+        if self.inner.tx.is_closed() {
+            Err(std::sync::mpsc::TrySendError::Disconnected(data))
+        } else {
+            Ok(())
+        }
     }
 
     pub(crate) fn reset_generation(&self) {
@@ -835,7 +833,7 @@ async fn publish_control_output(mut stream: SendStream, queue: Arc<BoundedContro
 
 async fn publish_server_output(
     connection: Connection,
-    mut render_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    mut render_rx: mpsc::UnboundedReceiver<TerminalFrame>,
     mut generation_rx: watch::Receiver<u64>,
     render_sender: Arc<QuicRenderSenderInner>,
     connection_generation: u64,
@@ -848,6 +846,12 @@ async fn publish_server_output(
     let state_revision = AtomicU64::new(0);
     let mut render_stream: Option<SendStream> = None;
     let mut active_generation = *generation_rx.borrow_and_update();
+    let reset_stream = |stream: &mut Option<SendStream>, gen_rx: &mut watch::Receiver<u64>| {
+        if let Some(mut s) = stream.take() {
+            let _ = s.reset(VarInt::from_u32(REPLACED_CODE));
+        }
+        *gen_rx.borrow_and_update()
+    };
 
     loop {
         tokio::select! {
@@ -856,10 +860,7 @@ async fn publish_server_output(
                 if changed.is_err() {
                     break;
                 }
-                active_generation = *generation_rx.borrow_and_update();
-                if let Some(mut stream) = render_stream.take() {
-                    let _ = stream.reset(VarInt::from_u32(REPLACED_CODE));
-                }
+                active_generation = reset_stream(&mut render_stream, &mut generation_rx);
             }
             render = render_rx.recv() => {
                 let Some(render) = render else { break; };
@@ -875,14 +876,12 @@ async fn publish_server_output(
                     Arc::clone(&sent_resources),
                 ).await;
                 if result == PublishRenderResult::GenerationChanged {
-                    active_generation = *generation_rx.borrow_and_update();
-                    if let Some(mut stream) = render_stream.take() {
-                        let _ = stream.reset(VarInt::from_u32(REPLACED_CODE));
-                    }
+                    active_generation = reset_stream(&mut render_stream, &mut generation_rx);
                 }
                 render_sender.busy.store(false, Ordering::Release);
                 let _ = server_event_tx.send(ServerEvent::ClientWriterDrained { client_id }).await;
                 if result == PublishRenderResult::Closed {
+                    let _ = server_event_tx.send(ServerEvent::ClientDisconnected { client_id }).await;
                     break;
                 }
             }
@@ -904,23 +903,10 @@ async fn publish_render(
     connection_generation: u64,
     render_generation: u64,
     state_revision: u64,
-    framed: Vec<u8>,
+    mut frame: TerminalFrame,
     resource_limit: Arc<Semaphore>,
     sent_resources: Arc<Mutex<HashSet<[u8; REMOTE_QUIC_HASH_BYTES]>>>,
 ) -> PublishRenderResult {
-    let message = match protocol::read_message::<_, ServerMessage>(
-        &mut framed.as_slice(),
-        MAX_GRAPHICS_FRAME_SIZE,
-    ) {
-        Ok(message) => message,
-        Err(err) => {
-            warn!(err = %err, "failed to decode queued QUIC render");
-            return PublishRenderResult::Sent;
-        }
-    };
-    let ServerMessage::Terminal(mut frame) = message else {
-        return PublishRenderResult::Sent;
-    };
     let original = std::mem::take(&mut frame.bytes);
     let (text, graphics) = split_kitty_sequences(&original);
     let can_externalize = graphics.len() <= MAX_RESOURCE_REFS_PER_FRAME
@@ -953,14 +939,9 @@ async fn publish_render(
     }
 
     if render_stream.is_none() {
-        let mut stream = match connection.open_uni().await {
-            Ok(stream) => stream,
-            Err(_) => return PublishRenderResult::Closed,
+        let Ok(mut stream) = connection.open_uni().await else {
+            return PublishRenderResult::Closed;
         };
-        // Ranked below graphics resources, not above them: the client cannot
-        // apply a record that references an uncached resource, so starving the
-        // resource would stall this stream's own records. See
-        // PRIORITY_CONTROL.
         let _ = stream.set_priority(PRIORITY_RENDER);
         let header = RemoteQuicStreamHeader::Render {
             connection_generation,
@@ -1084,6 +1065,7 @@ fn unix_seconds() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::remote::quic_policy::{MAX_RECORD_OVERHEAD, STRUCTURAL_RECORD_HEADER_BOUND};
 
     #[test]
     fn port_range_requires_ascending_unprivileged_ports() {
@@ -1091,6 +1073,41 @@ mod tests {
         assert!(parse_port_range("80-81").is_err());
         assert!(parse_port_range("48100-48000").is_err());
         assert!(parse_port_range("invalid").is_err());
+    }
+
+    #[test]
+    fn test_quic_record_structural_overhead_bound() {
+        let frame = TerminalFrame {
+            seq: u64::MAX,
+            width: u16::MAX,
+            height: u16::MAX,
+            full: true,
+            bytes: vec![0; 64],
+        };
+        let mut rec = RemoteQuicRenderRecord {
+            connection_generation: u64::MAX,
+            render_generation: u64::MAX,
+            state_revision: u64::MAX,
+            frame,
+            resources: Vec::new(),
+        };
+        let text_overhead = bincode::serde::encode_to_vec(&rec, bincode::config::standard())
+            .unwrap()
+            .len()
+            - 64;
+        assert!(text_overhead <= STRUCTURAL_RECORD_HEADER_BOUND);
+        rec.resources = vec![
+            RemoteQuicResourceRef {
+                hash: [0xFF; REMOTE_QUIC_HASH_BYTES],
+                text_offset: u32::MAX,
+            };
+            MAX_RESOURCE_REFS_PER_FRAME
+        ];
+        let gfx_overhead = bincode::serde::encode_to_vec(&rec, bincode::config::standard())
+            .unwrap()
+            .len()
+            - 64;
+        assert!(gfx_overhead <= MAX_RECORD_OVERHEAD);
     }
 
     fn capability_fixture() -> (

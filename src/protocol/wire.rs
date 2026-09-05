@@ -752,7 +752,7 @@ impl FrameData {
 }
 
 /// Terminal ANSI bytes encoded by the server for network-efficient clients.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TerminalFrame {
     /// Monotonic per-client frame sequence.
     pub seq: u64,

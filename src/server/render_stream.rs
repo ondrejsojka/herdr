@@ -202,6 +202,16 @@ impl PreparedRender {
             _ => None,
         }
     }
+
+    pub(crate) fn take_terminal_frame(&mut self) -> Option<TerminalFrame> {
+        match self {
+            Self::TerminalAnsi {
+                message: ServerMessage::Terminal(frame),
+                ..
+            } => Some(std::mem::take(frame)),
+            _ => None,
+        }
+    }
 }
 
 struct CursorTrackingBackend {
