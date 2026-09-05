@@ -65,8 +65,6 @@ impl ClientWriter {
             },
             render: ClientRenderWriter {
                 target: ClientRenderTarget::Quic(render),
-                #[cfg(test)]
-                test_render: None,
             },
         }
     }
@@ -79,6 +77,13 @@ impl ClientWriter {
                 self.render.reset_generation();
                 let _ = self.control.send(data);
             }
+            // Bypasses the queue like every other `Channel` send, so cleanup is
+            // not ordered against control writes. Tests that care about that
+            // ordering must use `test_queue`, which keeps the real queue.
+            #[cfg(test)]
+            ClientRenderTarget::Channel(_) => {
+                let _ = self.render.try_send(data);
+            }
         }
     }
 
@@ -87,10 +92,14 @@ impl ClientWriter {
         self.render.try_send(data).unwrap();
     }
 
+    /// Closes the shared writer queue both halves feed, whatever the render
+    /// target is, so a test can simulate a client whose writer loop is gone.
     #[cfg(test)]
     pub(crate) fn test_close(&self) {
-        if let ClientRenderTarget::Queue(queue) = &self.render.target {
-            queue.close_writer();
+        match &self.control.target {
+            ClientControlTarget::Queue(queue) => queue.close_writer(),
+            #[cfg(unix)]
+            ClientControlTarget::Quic(_) => {}
         }
     }
 
@@ -102,8 +111,7 @@ impl ClientWriter {
         let queue = ClientWriterQueue::new();
         let drain = queue.clone();
         let control_writer = ClientControlWriter::queue(queue.clone());
-        let mut render_writer = ClientRenderWriter::queue(queue);
-        render_writer.test_render = Some(render.clone());
+        let render_writer = ClientRenderWriter::channel(render.clone());
         let writer = Self {
             control: control_writer,
             render: render_writer,
@@ -186,8 +194,6 @@ enum ClientControlTarget {
 #[derive(Debug)]
 pub(crate) struct ClientRenderWriter {
     target: ClientRenderTarget,
-    #[cfg(test)]
-    test_render: Option<std::sync::mpsc::SyncSender<Vec<u8>>>,
 }
 
 #[derive(Clone, Debug)]
@@ -195,6 +201,11 @@ enum ClientRenderTarget {
     Queue(Arc<ClientWriterQueue>),
     #[cfg(unix)]
     Quic(crate::server::remote_quic::QuicRenderSender),
+    /// Hands renders straight to a channel, bypassing the single-slot
+    /// acceptance gate. A target like the others so production `try_send`
+    /// keeps one match and no test-only branch.
+    #[cfg(test)]
+    Channel(std::sync::mpsc::SyncSender<Vec<u8>>),
 }
 
 impl Clone for ClientControlWriter {
@@ -243,11 +254,11 @@ impl Clone for ClientRenderWriter {
             ClientRenderTarget::Queue(queue) => queue.add_sender(),
             #[cfg(unix)]
             ClientRenderTarget::Quic(_) => {}
+            #[cfg(test)]
+            ClientRenderTarget::Channel(_) => {}
         }
         Self {
             target: self.target.clone(),
-            #[cfg(test)]
-            test_render: self.test_render.clone(),
         }
     }
 }
@@ -258,6 +269,8 @@ impl Drop for ClientRenderWriter {
             ClientRenderTarget::Queue(queue) => queue.remove_sender(),
             #[cfg(unix)]
             ClientRenderTarget::Quic(_) => {}
+            #[cfg(test)]
+            ClientRenderTarget::Channel(_) => {}
         }
     }
 }
@@ -267,20 +280,23 @@ impl ClientRenderWriter {
         queue.add_sender();
         Self {
             target: ClientRenderTarget::Queue(queue),
-            #[cfg(test)]
-            test_render: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn channel(sender: std::sync::mpsc::SyncSender<Vec<u8>>) -> Self {
+        Self {
+            target: ClientRenderTarget::Channel(sender),
         }
     }
 
     pub(crate) fn try_send(&self, data: Vec<u8>) -> Result<(), TrySendError<Vec<u8>>> {
-        #[cfg(test)]
-        if let Some(sender) = &self.test_render {
-            return sender.try_send(data);
-        }
         match &self.target {
             ClientRenderTarget::Queue(queue) => queue.try_send_render(data),
             #[cfg(unix)]
             ClientRenderTarget::Quic(sender) => sender.try_send(data),
+            #[cfg(test)]
+            ClientRenderTarget::Channel(sender) => sender.try_send(data),
         }
     }
     pub(crate) fn is_structured(&self) -> bool {
@@ -309,6 +325,8 @@ impl ClientRenderWriter {
             ClientRenderTarget::Queue(queue) => queue.send_ordered(data),
             #[cfg(unix)]
             ClientRenderTarget::Quic(sender) => sender.try_send(data),
+            #[cfg(test)]
+            ClientRenderTarget::Channel(sender) => sender.try_send(data),
         }
     }
 

@@ -571,11 +571,11 @@ impl App {
         self.handle_modified_url_click_with(source_id, mouse, move |url| {
             // Client-local side effect (like ClipboardWrite): emit an event so headless
             // servers forward OpenUrl to the foreground thin client instead of opening
-            // a browser on the remote host.
+            // a browser on the remote host. The opener process, and reaping it, belong
+            // to whoever handles the event.
             let _ = event_tx.try_send(crate::events::AppEvent::OpenUrl {
                 url: url.to_owned(),
             });
-            Ok(None)
         })
     }
 
@@ -583,7 +583,7 @@ impl App {
         &mut self,
         source_id: super::InputSourceId,
         mouse: MouseEvent,
-        open_url: impl FnOnce(&str) -> std::io::Result<Option<std::process::Child>>,
+        emit_url: impl FnOnce(&str),
     ) -> bool {
         if self.state.mode != Mode::Terminal
             || !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
@@ -620,13 +620,7 @@ impl App {
         if plugin_handled {
             return true;
         }
-        match open_url(&url) {
-            Ok(Some(child)) => self.detached_process_children.push(child),
-            Ok(None) => {}
-            Err(err) => {
-                tracing::warn!(err = %err, url = %url, "failed to open pane URL");
-            }
-        }
+        emit_url(&url);
         true
     }
 
