@@ -51,6 +51,34 @@ pub(crate) fn configure_background_command(command: &mut std::process::Command) 
     configure_background_command_platform(command);
 }
 
+/// Whether a polled child should stay in the pending set: it has not exited, or
+/// the wait was interrupted and must be retried. A failed wait is logged and
+/// dropped, since retrying it forever would leak the entry instead of the child.
+fn retain_detached_process_after_wait(
+    pid: u32,
+    result: std::io::Result<Option<std::process::ExitStatus>>,
+) -> bool {
+    match result {
+        Ok(None) => true,
+        Ok(Some(_)) => false,
+        Err(err) if err.kind() == std::io::ErrorKind::Interrupted => true,
+        Err(err) => {
+            tracing::warn!(pid, err = %err, "failed to reap detached process");
+            false
+        }
+    }
+}
+
+/// Reaps every detached child that has exited, keeping the rest for a later poll.
+///
+/// `open_url` and the navigate-mode launchers hand back a `Child` that nobody
+/// waits on, so every owner has to poll it or leave a zombie behind. Lives beside
+/// the spawners that produce those children so there is one reaping rule for all
+/// of them; callers just need somewhere to keep the `Vec` and a place to poll it.
+pub(crate) fn reap_detached_children(children: &mut Vec<std::process::Child>) {
+    children.retain_mut(|child| retain_detached_process_after_wait(child.id(), child.try_wait()));
+}
+
 #[cfg(not(windows))]
 fn configure_background_command_platform(_command: &mut std::process::Command) {}
 
@@ -379,6 +407,13 @@ impl PrefixInputSource for RealPrefixInputSource {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn interrupted_detached_process_wait_keeps_child_for_retry() {
+        let interrupted = std::io::Error::new(std::io::ErrorKind::Interrupted, "test interrupt");
+
+        assert!(retain_detached_process_after_wait(42, Err(interrupted)));
+    }
 
     #[test]
     fn terminal_resize_signal_is_recorded_once_per_delivery() {

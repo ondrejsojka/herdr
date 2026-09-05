@@ -34,6 +34,19 @@ const OUTPUT_QUEUE_ITEMS: usize = 16;
 const SSH_RECONNECT_DELAY: Duration = Duration::from_secs(1);
 const SSH_REBOOTSTRAP_DEADLINE: Duration = Duration::from_secs(15);
 const SSH_REBOOTSTRAP_RETRY_DELAY: Duration = Duration::from_millis(250);
+/// First delay before retrying QUIC after a live session dropped, doubling per
+/// consecutive failure up to [`QUIC_RECONNECT_MAX_DELAY`]. Without it a session
+/// that fails immediately on connect — a displaced generation, a reset render
+/// stream — spins full-speed TLS handshakes on both ends.
+const QUIC_RECONNECT_BASE_DELAY: Duration = Duration::from_millis(250);
+const QUIC_RECONNECT_MAX_DELAY: Duration = Duration::from_secs(4);
+/// Consecutive immediate session failures tolerated before escalating to SSH
+/// rebootstrap. Backoff alone cannot fix a stale capability; the ladder must
+/// still reach a state that can.
+const MAX_CONSECUTIVE_QUIC_RETRIES: u32 = 5;
+/// A session that stayed up this long counts as healthy, so its next failure
+/// starts a fresh retry budget instead of inheriting an old outage's count.
+const QUIC_SESSION_STABLE_AFTER: Duration = Duration::from_secs(30);
 
 pub(super) struct BridgeConfig {
     pub(super) target: String,
@@ -388,14 +401,40 @@ enum QuicOutcome {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum QuicAttempt {
     Initial,
-    Fresh,
+    /// Reconnect after a live session dropped, carrying the count of
+    /// consecutive short-lived sessions so the ladder can escalate.
+    Fresh(u32),
     Rebootstrapped,
+}
+
+impl QuicAttempt {
+    /// Consecutive failures already spent. A connect that follows anything but
+    /// a failed live session starts the budget over.
+    fn retries(self) -> u32 {
+        match self {
+            Self::Fresh(retries) => retries,
+            Self::Initial | Self::Rebootstrapped => 0,
+        }
+    }
+}
+
+/// Exponential backoff for the `retries`-th consecutive reconnect, capped so a
+/// long outage still retries at a useful cadence.
+fn quic_reconnect_delay(retries: u32) -> Duration {
+    QUIC_RECONNECT_BASE_DELAY
+        .saturating_mul(
+            1u32.checked_shl(retries.saturating_sub(1))
+                .unwrap_or(u32::MAX),
+        )
+        .min(QUIC_RECONNECT_MAX_DELAY)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum TransportPhase {
     QuicConnecting(QuicAttempt),
-    QuicLive,
+    /// Carries the retry budget spent reaching this session so an immediately
+    /// failing session cannot reset it by connecting successfully.
+    QuicLive(u32),
     SshRebootstrap,
     SshFallback(String),
     Done(QuicOutcome),
@@ -405,7 +444,11 @@ enum TransportPhase {
 enum TransportEvent {
     QuicConnected,
     QuicConnectFailed(String),
-    SessionExited(SessionExit),
+    SessionExited {
+        exit: SessionExit,
+        /// Whether the session stayed up long enough to count as healthy.
+        stable: bool,
+    },
     RebootstrapSucceeded,
     RebootstrapFailed(String),
     ClientDetached,
@@ -416,6 +459,8 @@ enum TransportAction {
     ConnectQuic {
         recovering: bool,
         detail: Option<String>,
+        /// Slept before dialing, so repeated immediate failures back off.
+        delay: Duration,
     },
     RunQuic {
         recovering: bool,
@@ -440,7 +485,7 @@ fn next_transport_phase(
 
     match (phase, event) {
         (TransportPhase::QuicConnecting(attempt), TransportEvent::QuicConnected) => (
-            TransportPhase::QuicLive,
+            TransportPhase::QuicLive(attempt.retries()),
             TransportAction::RunQuic {
                 recovering: attempt != QuicAttempt::Initial,
             },
@@ -457,30 +502,57 @@ fn next_transport_phase(
             TransportAction::StartSshFallback,
         ),
         (
-            TransportPhase::QuicConnecting(QuicAttempt::Fresh),
+            TransportPhase::QuicConnecting(QuicAttempt::Fresh(_)),
             TransportEvent::QuicConnectFailed(detail),
         ) => (
             TransportPhase::SshRebootstrap,
             TransportAction::Rebootstrap { detail },
         ),
         (
-            TransportPhase::QuicLive,
-            TransportEvent::SessionExited(SessionExit::RetryFresh(detail)),
-        ) => (
-            TransportPhase::QuicConnecting(QuicAttempt::Fresh),
-            TransportAction::ConnectQuic {
-                recovering: true,
-                detail: Some(detail),
+            TransportPhase::QuicLive(spent),
+            TransportEvent::SessionExited {
+                exit: SessionExit::RetryFresh(detail),
+                stable,
             },
-        ),
+        ) => {
+            // A healthy session that finally dropped starts a new budget; a
+            // session that died immediately keeps spending the old one.
+            let retries = if stable { 1 } else { spent.saturating_add(1) };
+            if retries > MAX_CONSECUTIVE_QUIC_RETRIES {
+                // Backoff cannot repair a stale capability or a replaced
+                // generation, so escalate to the rung that can.
+                (
+                    TransportPhase::SshRebootstrap,
+                    TransportAction::Rebootstrap { detail },
+                )
+            } else {
+                (
+                    TransportPhase::QuicConnecting(QuicAttempt::Fresh(retries)),
+                    TransportAction::ConnectQuic {
+                        recovering: true,
+                        detail: Some(detail),
+                        delay: quic_reconnect_delay(retries),
+                    },
+                )
+            }
+        }
         (
-            TransportPhase::QuicLive,
-            TransportEvent::SessionExited(SessionExit::Rebootstrap(detail)),
+            TransportPhase::QuicLive(_),
+            TransportEvent::SessionExited {
+                exit: SessionExit::Rebootstrap(detail),
+                ..
+            },
         ) => (
             TransportPhase::SshRebootstrap,
             TransportAction::Rebootstrap { detail },
         ),
-        (TransportPhase::QuicLive, TransportEvent::SessionExited(SessionExit::Detached)) => (
+        (
+            TransportPhase::QuicLive(_),
+            TransportEvent::SessionExited {
+                exit: SessionExit::Detached,
+                ..
+            },
+        ) => (
             TransportPhase::Done(QuicOutcome::Detached),
             TransportAction::Finish,
         ),
@@ -489,6 +561,7 @@ fn next_transport_phase(
             TransportAction::ConnectQuic {
                 recovering: true,
                 detail: None,
+                delay: Duration::ZERO,
             },
         ),
         (TransportPhase::SshRebootstrap, TransportEvent::RebootstrapFailed(detail)) => (
@@ -532,6 +605,7 @@ fn run_quic(
     let mut action = TransportAction::ConnectQuic {
         recovering: false,
         detail: None,
+        delay: Duration::ZERO,
     };
 
     loop {
@@ -540,10 +614,20 @@ fn run_quic(
         }
 
         let event = match action {
-            TransportAction::ConnectQuic { recovering, detail } => {
+            TransportAction::ConnectQuic {
+                recovering,
+                detail,
+                delay,
+            } => {
                 if let Some(detail) = detail {
                     debug!(%detail, "remote QUIC connection lost; trying fresh QUIC");
                 }
+                // Announce before the backoff, not after. The router already
+                // cleared its active sender, so input is being discarded for the
+                // whole delay, and a session that failed without going stale
+                // first never announced PathRecovering. Waiting until after the
+                // sleep leaves the client showing a connected transport for up
+                // to QUIC_RECONNECT_MAX_DELAY while its keystrokes vanish.
                 if recovering
                     && output
                         .blocking_send(ServerMessage::TransportStatus {
@@ -553,6 +637,18 @@ fn run_quic(
                         .is_err()
                 {
                     return QuicOutcome::Detached;
+                }
+                if !delay.is_zero() {
+                    // Detached clients must not be held here for the full backoff.
+                    let deadline = Instant::now() + delay;
+                    while Instant::now() < deadline && !router.is_detached() {
+                        thread::sleep(ACCEPT_POLL.min(deadline - Instant::now()));
+                    }
+                    if router.is_detached() {
+                        (phase, action) =
+                            next_transport_phase(phase, TransportEvent::ClientDetached);
+                        continue;
+                    }
                 }
 
                 let candidates = match remote_quic_candidates(hostname, bootstrap.port) {
@@ -613,15 +709,18 @@ fn run_quic(
                 }
                 let (input_tx, input_rx) = mpsc::channel(INPUT_QUEUE_ITEMS);
                 router.set_active(input_tx);
+                let started_at = Instant::now();
                 let exit = runtime.block_on(session.run(input_rx, output.clone(), recovering));
+                let stable = started_at.elapsed() >= QUIC_SESSION_STABLE_AFTER;
                 warn!(
                     target = %config.target,
                     generation = connection_generation,
                     ?exit,
+                    stable,
                     "remote QUIC session ended"
                 );
                 router.clear_active();
-                TransportEvent::SessionExited(exit)
+                TransportEvent::SessionExited { exit, stable }
             }
             TransportAction::Rebootstrap { detail } => {
                 if output
@@ -1030,19 +1129,23 @@ mod tests {
             TransportPhase::QuicConnecting(QuicAttempt::Initial),
             TransportEvent::QuicConnected,
         );
-        assert_eq!(phase, TransportPhase::QuicLive);
+        assert_eq!(phase, TransportPhase::QuicLive(0));
         assert_eq!(action, TransportAction::RunQuic { recovering: false });
 
         let (phase, action) = next_transport_phase(
             phase,
-            TransportEvent::SessionExited(SessionExit::RetryFresh("path lost".to_owned())),
+            TransportEvent::SessionExited {
+                exit: SessionExit::RetryFresh("path lost".to_owned()),
+                stable: false,
+            },
         );
-        assert_eq!(phase, TransportPhase::QuicConnecting(QuicAttempt::Fresh));
+        assert_eq!(phase, TransportPhase::QuicConnecting(QuicAttempt::Fresh(1)));
         assert_eq!(
             action,
             TransportAction::ConnectQuic {
                 recovering: true,
                 detail: Some("path lost".to_owned()),
+                delay: QUIC_RECONNECT_BASE_DELAY,
             }
         );
 
@@ -1068,6 +1171,7 @@ mod tests {
             TransportAction::ConnectQuic {
                 recovering: true,
                 detail: None,
+                delay: Duration::ZERO,
             }
         );
 
@@ -1085,10 +1189,11 @@ mod tests {
     #[test]
     fn transport_machine_handles_direct_rebootstrap_and_terminal_states() {
         let (phase, action) = next_transport_phase(
-            TransportPhase::QuicLive,
-            TransportEvent::SessionExited(SessionExit::Rebootstrap(
-                "server instance changed".to_owned(),
-            )),
+            TransportPhase::QuicLive(0),
+            TransportEvent::SessionExited {
+                exit: SessionExit::Rebootstrap("server instance changed".to_owned()),
+                stable: false,
+            },
         );
         assert_eq!(phase, TransportPhase::SshRebootstrap);
         assert_eq!(
@@ -1109,8 +1214,86 @@ mod tests {
         assert_eq!(action, TransportAction::StartSshFallback);
 
         let (phase, action) =
-            next_transport_phase(TransportPhase::QuicLive, TransportEvent::ClientDetached);
+            next_transport_phase(TransportPhase::QuicLive(0), TransportEvent::ClientDetached);
         assert_eq!(phase, TransportPhase::Done(QuicOutcome::Detached));
         assert_eq!(action, TransportAction::Finish);
+    }
+
+    #[test]
+    fn repeated_immediate_session_failures_back_off_then_escalate() {
+        let mut phase = TransportPhase::QuicLive(0);
+        let mut delays = Vec::new();
+
+        // A session that connects and dies immediately, over and over, must not
+        // reconnect without pause and must eventually leave the QUIC rung.
+        let escalation = loop {
+            let (next, action) = next_transport_phase(
+                phase,
+                TransportEvent::SessionExited {
+                    exit: SessionExit::RetryFresh("displaced".to_owned()),
+                    stable: false,
+                },
+            );
+            match action {
+                TransportAction::ConnectQuic { delay, .. } => {
+                    assert!(!delay.is_zero(), "reconnect must wait before redialing");
+                    delays.push(delay);
+                    // The driver reconnects, so the next failure spends more budget.
+                    let (live, _) = next_transport_phase(next, TransportEvent::QuicConnected);
+                    phase = live;
+                }
+                other => break other,
+            }
+            assert!(
+                delays.len() <= MAX_CONSECUTIVE_QUIC_RETRIES as usize,
+                "retry budget must be finite"
+            );
+        };
+
+        assert_eq!(
+            escalation,
+            TransportAction::Rebootstrap {
+                detail: "displaced".to_owned()
+            }
+        );
+        // Exact sequence, not merely nondecreasing: a constant 250ms would pass
+        // a monotonicity check while silently dropping exponential backoff.
+        assert_eq!(
+            delays,
+            vec![
+                Duration::from_millis(250),
+                Duration::from_millis(500),
+                Duration::from_secs(1),
+                Duration::from_secs(2),
+                Duration::from_secs(4),
+            ],
+            "backoff must double until it reaches the cap"
+        );
+        assert_eq!(
+            delays.last().copied(),
+            Some(QUIC_RECONNECT_MAX_DELAY),
+            "the budget must be spent at the cap, not below it"
+        );
+    }
+
+    #[test]
+    fn a_healthy_session_restores_the_quic_retry_budget() {
+        let (phase, action) = next_transport_phase(
+            TransportPhase::QuicLive(MAX_CONSECUTIVE_QUIC_RETRIES),
+            TransportEvent::SessionExited {
+                exit: SessionExit::RetryFresh("path lost".to_owned()),
+                stable: true,
+            },
+        );
+
+        assert_eq!(phase, TransportPhase::QuicConnecting(QuicAttempt::Fresh(1)));
+        assert_eq!(
+            action,
+            TransportAction::ConnectQuic {
+                recovering: true,
+                detail: Some("path lost".to_owned()),
+                delay: QUIC_RECONNECT_BASE_DELAY,
+            }
+        );
     }
 }

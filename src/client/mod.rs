@@ -100,6 +100,9 @@ struct ClientState {
     draw_host_cursor: bool,
     /// True while the remote proxy is reconnecting; pane input is discarded locally.
     transport_stale: bool,
+    /// Detached URL openers spawned for forwarded `OpenUrl`, polled so a thin
+    /// client attached for days does not accumulate zombies.
+    url_opener_children: Vec<std::process::Child>,
 }
 
 #[derive(Debug, Default)]
@@ -1433,6 +1436,7 @@ async fn run_client_loop(
         repaint_pending: false,
         draw_host_cursor,
         transport_stale: false,
+        url_opener_children: Vec::new(),
     };
     debug!(?negotiated_encoding, "client render encoding active");
     let host_mouse_capture_active = Arc::new(AtomicBool::new(state.mouse_capture_active));
@@ -1536,6 +1540,7 @@ async fn run_client_loop(
 
     // Main event loop.
     while !should_quit.load(Ordering::Acquire) {
+        crate::platform::reap_detached_children(&mut state.url_opener_children);
         let event = tokio::select! {
             ev = event_rx.recv() => ev.unwrap_or(ClientLoopEvent::Timer),
             _ = tokio::time::sleep(Duration::from_millis(100)) => ClientLoopEvent::Timer,
@@ -1867,11 +1872,13 @@ async fn run_client_loop(
                     forward_clipboard(&data);
                     let _ = io::stdout().flush();
                 }
-                ServerMessage::OpenUrl { url } => {
-                    if let Err(err) = crate::platform::open_url(&url) {
+                ServerMessage::OpenUrl { url } => match crate::platform::open_url(&url) {
+                    Ok(Some(child)) => state.url_opener_children.push(child),
+                    Ok(None) => {}
+                    Err(err) => {
                         tracing::warn!(err = %err, url = %url, "failed to open forwarded URL");
                     }
-                }
+                },
                 ServerMessage::WindowTitle { title } => {
                     let _ = crate::terminal_effects::write_window_title(
                         &mut io::stdout(),
