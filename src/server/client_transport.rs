@@ -526,6 +526,19 @@ pub(crate) enum ServerEvent {
     ClientDisconnected { client_id: u64 },
     /// A client writer drained its render slot and can accept another render.
     ClientWriterDrained { client_id: u64 },
+    /// An authenticated local helper (`remote-quic-bootstrap` over SSH)
+    /// requested a process-lifetime QUIC capability.
+    RemoteBootstrap {
+        request: crate::protocol::RemoteBootstrapRequest,
+        respond_to: std::sync::mpsc::Sender<Result<crate::protocol::RemoteBootstrapRecord, String>>,
+    },
+    /// The QUIC endpoint accepted and authenticated a remote client; this is
+    /// the server-side end of its byte pipe, to be adopted like a freshly
+    /// accepted Unix-socket client.
+    #[cfg(unix)]
+    RemoteQuicClient {
+        stream: std::os::unix::net::UnixStream,
+    },
     /// Ctrl+C or external shutdown signal received.
     QuitSignal,
 }
@@ -639,6 +652,39 @@ fn set_client_recv_timeout(
     stream.set_recv_timeout(timeout)
 }
 
+/// Answer a `remote-quic-bootstrap` helper. The helper is not a client: it
+/// sends one request as its first frame, reads one reply, and exits.
+fn respond_to_remote_bootstrap(
+    stream: &mut LocalStream,
+    client_id: u64,
+    request: crate::protocol::RemoteBootstrapRequest,
+    server_event_tx: &mpsc::Sender<ServerEvent>,
+) {
+    let (respond_to, response_rx) = std::sync::mpsc::channel();
+    let result = if server_event_tx
+        .blocking_send(ServerEvent::RemoteBootstrap {
+            request,
+            respond_to,
+        })
+        .is_err()
+    {
+        Err("server is shutting down".to_owned())
+    } else {
+        match response_rx.recv_timeout(HANDSHAKE_TIMEOUT) {
+            Ok(result) => result,
+            Err(_) => Err("remote QUIC bootstrap timed out".to_owned()),
+        }
+    };
+    let (record, error) = match result {
+        Ok(record) => (Some(record), None),
+        Err(error) => {
+            debug!(client_id, %error, "remote QUIC bootstrap refused");
+            (None, Some(error))
+        }
+    };
+    let _ = protocol::write_message(stream, &ServerMessage::RemoteBootstrap { record, error });
+}
+
 /// Handles the client handshake on a blocking thread.
 ///
 /// Reads the `TerminalHello` or `ClientShellHello` message, validates the version,
@@ -680,6 +726,11 @@ pub(crate) fn handle_client_handshake(
             return Ok(());
         }
     };
+
+    if let ClientMessage::RemoteBootstrap(request) = hello {
+        respond_to_remote_bootstrap(&mut stream, client_id, request, server_event_tx);
+        return Ok(());
+    }
 
     let (
         client_cols,

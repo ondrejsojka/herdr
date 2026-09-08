@@ -72,14 +72,14 @@ happens (no `ssh` re-exec, no auth round).
 | Client authorization | 32-byte capability token scoped to Unix user, session, server instance, logical client id. Server stores SHA-256 only, bounded table, fenced per connection generation. Presented only inside the pinned TLS connection as the first frame (`RemoteQuicHello`). |
 | Credential lifetime | Token/idle lifetime default 24 h, configurable. Not persisted across a cold restart. Transferred across live handoff. |
 | Handoff | `perform_live_handoff` exports/imports cert, key, instance id, tokens, and UDP fds so QUIC clients re-dial the successor with their token and no SSH. `HandoffManifest.remote_quic` is optional; absent on stock servers. |
-| Capability negotiation | Server advertises `remote_quic` in `endpoint.welcome.v1` capabilities when it can start QUIC (Unix, `remote.transport = auto`). Bridge attempts bootstrap only when advertised; against stock servers it never tries. `remote-quic-bootstrap` failing on stock binaries is belt-and-braces. Bootstrap record and `RemoteQuicHello` carry their own `REMOTE_QUIC_SCHEMA_VERSION`, never `PROTOCOL_VERSION`. |
+| Server detection | Bootstrap-only: the bridge runs `remote-quic-bootstrap` over SSH; a stock server (unknown subcommand) or a server with `remote.transport = ssh` fails it, and the bridge stays on SSH for that connection. No capability string in `endpoint.welcome.v1`, no `herdr status` field: the bridge decides before any welcome exists, and one failed SSH round per process per target is cheaper than plumbing a flag through every status path. Bootstrap record and `RemoteQuicHello` carry their own `REMOTE_QUIC_SCHEMA_VERSION`, never `PROTOCOL_VERSION`. |
 | Congestion control | quinn with BBR on both sides. No runtime knob. A compile-time Cubic swap exists only if it stays under 20 LOC. |
 | Streams | One bidirectional stream per connection carrying the framed protocol in both directions. QUIC provides reliability, ordering, retransmission, migration. No stream-per-message, no application TCP analogue. |
 | Input semantics | Input flows while the connection is alive, regardless of render staleness. Frozen only once the client is Reconnecting. No replay across a destroyed connection: a final pre-loss key may be lost, never duplicated. |
 | Multi-client | A fresh QUIC connection is an ordinary new client connection; upstream's foreground/projection semantics apply unchanged. Older connection generations for the same token are fenced. |
 | Config | `[remote] transport = "auto" \| "ssh"`, `quic_port_range`, `quic_idle_timeout_seconds` (credential lifetime, 24 h), `quic_transport_idle_timeout_seconds` (180 s default: must exceed the 150 s roaming grace or the server drops a tunnel-length blackhole before the client would). `auto` = QUIC then SSH. No `quic`-only mode, no `ssh_fallback` toggle, no grace knob. `endpoints.json` schema unchanged (`deny_unknown_fields`). |
 | Platform | Unix clients; Linux/macOS remotes. Windows client remains SSH-only; quinn deps are Unix-gated. |
-| Upstream engagement | Fork feature, no PR. Capability negotiation makes fork clients work against stock servers and stock clients ignore fork servers. |
+| Upstream engagement | Fork feature, no PR. Fork clients work against stock servers (bootstrap fails → SSH) and stock clients never send a bootstrap request. |
 
 ## 4. Goals and non-goals
 
@@ -150,7 +150,7 @@ One ladder run per accepted local connection:
   unanswered probes, `Endpoint::rebind()` every 10 s of silence (sleep → tether →
   wifi must not strand on the second-to-last address), lost at 150 s. Probes are
   ordinary `endpoint.health.ping.v1` frames; any received frame is liveness.
-- Emits `endpoint.transport.status.v1 { state: live | recovering | ssh }` to the
+- Emits `endpoint.transport.status.v1 { state: live | recovering }` to the
   thin client on transitions. Never forwards it upstream.
 - Lost, superseded, or server-closed → close the local socket. The supervisor's
   next connection reuses the cached credential with `connection_generation + 1`
@@ -193,7 +193,7 @@ bottleneck bandwidth. quinn documents BBR as experimental; the benchmark harness
 | `src/remote/saved.rs::connect_saved_ssh` | Replace `SshStdioBridge::start` with the ladder-driven bridge (noninteractive: never prompts; QUIC failure is silent). |
 | `src/remote/attach.rs::run_remote` | Same replacement (interactive); `run_client_process` unchanged. Add `remote-quic-bootstrap` subcommand + `request_remote_quic_bootstrap` + candidate resolution. |
 | `src/main.rs` | Hidden `remote-quic-bootstrap` dispatch next to `remote-client-bridge`. |
-| `src/protocol/endpoint.rs` | `REMOTE_QUIC_CAPABILITY = "remote_quic"`, `TRANSPORT_STATUS_KIND = "endpoint.transport.status.v1"`. Advertise from `EndpointServerWelcome::compatible` when the server can start QUIC. |
+| `src/protocol/endpoint.rs` | `TRANSPORT_STATUS_KIND = "endpoint.transport.status.v1"` (client-local). |
 | `src/protocol/wire.rs` | `ClientMessage::RemoteBootstrap(RemoteBootstrapRequest)`, `ServerMessage::RemoteBootstrap(RemoteBootstrapRecord)`, `RemoteQuicHello`, `REMOTE_QUIC_SCHEMA_VERSION`. Bump `PROTOCOL_VERSION` per the published-protocol rule. |
 | `src/server/headless/bootstrap.rs` (or `headless.rs`) | Hold `Option<RemoteQuicServer>`; lazy start on `ServerEvent::RemoteBootstrap`; accepted socketpairs enter the existing acceptor. |
 | `src/server/handoff.rs`, `headless/lifecycle.rs` | Optional `remote_quic` manifest field; export/import around `perform_live_handoff`. |
@@ -215,8 +215,8 @@ bottleneck bandwidth. quinn documents BBR as experimental; the benchmark harness
 
 ### 8.1 Compatibility gate
 
-- Stock v0.9.0 client ↔ fork server: identical behavior; extra capability ignored.
-- Fork client ↔ stock server: SSH path only; no bootstrap attempt; no UDP bind.
+- Stock v0.9.0 client ↔ fork server: identical behavior; no bootstrap ever requested.
+- Fork client ↔ stock server: bootstrap fails, SSH path only, no UDP dial.
 - Fork server without any `--remote` client: no UDP socket, no TLS material.
 - `transport = "ssh"`: byte-for-byte today's SSH bridge behavior.
 - `just check` green; `just bench-render-scale` unchanged.
@@ -276,7 +276,7 @@ Cherry-pick files, not commits (commits interleave core and integration).
 1. **Scaffold.** Cherry-pick kept modules, Cargo deps (Unix-gated), config keys.
    Compile with render-lane code removed. No integration.
 2. **Server adapter.** Accept → hello/token → socketpair → acceptor. Lazy start on
-   `ServerEvent::RemoteBootstrap`. Advertise `remote_quic`. Tests in §8.2.
+   `ServerEvent::RemoteBootstrap`. Tests in §8.2.
 3. **Client bridge.** `QuicBridge` listener wired into `connect_saved_ssh` and
    `run_remote` in place of `SshStdioBridge`; bridge-originated probes; local
    status hint.

@@ -21,26 +21,7 @@ pub(crate) fn accept_pending_client_connections(
         }
         match listener.accept() {
             Ok(stream) => {
-                let client_id = *next_client_id;
-                *next_client_id = next_client_id.saturating_add(1);
-
-                if let Err(err) = stream.set_nonblocking(true) {
-                    warn!(err = %err, "failed to set client stream nonblocking");
-                    continue;
-                }
-
-                let should_quit = should_quit.clone();
-                let server_event_tx = server_event_tx.clone();
-                std::thread::spawn(move || {
-                    if let Err(err) = client_transport::handle_client_handshake(
-                        stream,
-                        client_id,
-                        &server_event_tx,
-                        &should_quit,
-                    ) {
-                        debug!(client_id, err = %err, "client handshake failed");
-                    }
-                });
+                spawn_client_handshake(stream, next_client_id, should_quit, server_event_tx);
             }
             Err(ref err) if err.kind() == io::ErrorKind::WouldBlock => break,
             Err(err) => {
@@ -51,6 +32,49 @@ pub(crate) fn accept_pending_client_connections(
     }
 
     Ok(())
+}
+
+/// Adopts the server-side end of an authenticated remote QUIC client's byte
+/// pipe as an ordinary client: from here on nothing distinguishes it from a
+/// connection accepted on the Unix listener.
+pub(crate) fn adopt_remote_quic_client(
+    stream: std::os::unix::net::UnixStream,
+    next_client_id: &mut u64,
+    should_quit: &Arc<AtomicBool>,
+    server_event_tx: &mpsc::Sender<ServerEvent>,
+) {
+    let stream = crate::ipc::LocalStream::UdSocket(
+        interprocess::os::unix::uds_local_socket::Stream::from(stream),
+    );
+    spawn_client_handshake(stream, next_client_id, should_quit, server_event_tx);
+}
+
+fn spawn_client_handshake(
+    stream: crate::ipc::LocalStream,
+    next_client_id: &mut u64,
+    should_quit: &Arc<AtomicBool>,
+    server_event_tx: &mpsc::Sender<ServerEvent>,
+) {
+    let client_id = *next_client_id;
+    *next_client_id = next_client_id.saturating_add(1);
+
+    if let Err(err) = stream.set_nonblocking(true) {
+        warn!(err = %err, "failed to set client stream nonblocking");
+        return;
+    }
+
+    let should_quit = should_quit.clone();
+    let server_event_tx = server_event_tx.clone();
+    std::thread::spawn(move || {
+        if let Err(err) = client_transport::handle_client_handshake(
+            stream,
+            client_id,
+            &server_event_tx,
+            &should_quit,
+        ) {
+            debug!(client_id, err = %err, "client handshake failed");
+        }
+    });
 }
 
 /// Drains pending thin-client connections without starting handshakes.

@@ -195,7 +195,10 @@ fn run_client_with_mode(
     } else {
         endpoint::EndpointCatalog::default()
     };
-    let federated = endpoint_catalog.has_enabled_ssh();
+    // A `--remote` client's Local is a bridge socket that closes whenever the
+    // remote transport is replaced, so it is supervised like a saved machine:
+    // a lost connection reconnects instead of ending the client.
+    let federated = endpoint_catalog.has_enabled_ssh() || is_remote_client_process();
 
     let initial_stream = match crate::ipc::connect_local_stream(&socket_path) {
         Ok(stream) => Some(stream),
@@ -407,7 +410,7 @@ async fn run_client_loop(
         detached_process_children: Vec::new(),
         shell: config.shell_config.map(shell::ClientShellState::new),
     };
-    let mut federated = endpoint_catalog.has_enabled_ssh();
+    let mut federated = endpoint_catalog.has_enabled_ssh() || is_remote_client;
     if let Some(shell) = state.shell.as_mut() {
         shell.set_graphics_cell_size(initial_cell_width_px, initial_cell_height_px);
         shell.set_endpoint_catalog(&endpoint_catalog.ssh);
@@ -1825,6 +1828,15 @@ async fn run_client_loop(
                         }
                         let snapshot = match endpoint::decode_endpoint_control(&kind, &data) {
                             Ok(endpoint::EndpointControlMessage::HealthPong) => continue,
+                            Ok(endpoint::EndpointControlMessage::TransportRecovering(
+                                recovering,
+                            )) => {
+                                write_stream.set_recovering(&endpoint_id, generation, recovering);
+                                if let Some(shell) = state.shell.as_mut() {
+                                    shell.set_endpoint_roaming(&endpoint_id, recovering);
+                                }
+                                continue;
+                            }
                             Ok(endpoint::EndpointControlMessage::Ignored) => {
                                 debug!(%kind, "ignoring unknown endpoint control message");
                                 continue;

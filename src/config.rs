@@ -10,6 +10,8 @@ mod theme;
 mod window_title;
 mod write;
 
+#[cfg(unix)]
+pub use self::model::{RemoteTransportConfig, REMOTE_TRANSPORT_IDLE_TIMEOUT_MAX_SECONDS};
 pub use self::{
     io::{
         config_diagnostic_summary, config_dir, config_path, load_live_config,
@@ -24,10 +26,9 @@ pub use self::{
     model::{
         validated_sidebar_bounds, AgentPanelSortConfig, Config, ConfigReloadReport,
         ConfigReloadStatus, HostCursorModeConfig, NewTerminalCwdConfig, PaneBordersConfig,
-        RemoteConfig, RemoteTransportConfig, ShellModeConfig, SidebarCollapsedModeConfig,
-        StatusIndicatorStyle, TabBarPositionConfig, ToastClipboardPosition, ToastConfig,
-        ToastDelivery, ToastHerdrPosition, UpdateChannelConfig, MAX_TOAST_DELAY_SECONDS,
-        REMOTE_TRANSPORT_IDLE_TIMEOUT_MAX_SECONDS,
+        RemoteConfig, ShellModeConfig, SidebarCollapsedModeConfig, StatusIndicatorStyle,
+        TabBarPositionConfig, ToastClipboardPosition, ToastConfig, ToastDelivery,
+        ToastHerdrPosition, UpdateChannelConfig, MAX_TOAST_DELAY_SECONDS,
     },
     sidebar::{
         AgentSidebarToken, AgentsSidebarConfig, SidebarConfig, SidebarTokenStyle,

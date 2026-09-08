@@ -834,20 +834,14 @@ fn render_navigator_overlay(
                 status_style,
             );
         }
-        let machine_status = match &r.target {
+        let machine = match &r.target {
             ClientNavigatorTarget::Machine { endpoint_id } if !endpoint_id.is_local() => endpoints
                 .iter()
-                .find(|endpoint| &endpoint.endpoint_id == endpoint_id)
-                .map(|endpoint| endpoint.status),
+                .find(|endpoint| &endpoint.endpoint_id == endpoint_id),
             _ => None,
         };
-        if let Some(status) = machine_status {
-            let (glyph, state, color) = endpoint_status_presentation(status, p);
-            let signal = if status == ClientEndpointStatus::Online {
-                glyph.to_owned()
-            } else {
-                format!("{glyph} {state}")
-            };
+        if let Some(endpoint) = machine {
+            let (signal, color) = endpoint_signal(endpoint, p);
             let signal_style = if ix == selected {
                 st
             } else {

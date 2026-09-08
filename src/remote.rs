@@ -17,8 +17,15 @@ mod saved;
 pub(crate) use args::*;
 pub(crate) use attach::*;
 #[cfg(unix)]
-pub(crate) use host_unix::run_remote_client_bridge;
+pub(crate) use host_unix::{run_remote_client_bridge, run_remote_quic_bootstrap};
 pub(crate) use saved::*;
+
+#[cfg(windows)]
+pub(crate) fn run_remote_quic_bootstrap(_logical_client_id: Option<&str>) -> std::io::Result<()> {
+    Err(std::io::Error::other(
+        "remote Windows hosts are not supported yet",
+    ))
+}
 
 #[cfg(windows)]
 pub(crate) fn run_remote_client_bridge() -> std::io::Result<()> {

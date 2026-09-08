@@ -27,8 +27,6 @@ pub const PRESENTATION_EFFECTS_READY_KIND: &str = "endpoint.presentation.ready.v
 pub const HEALTH_CHECK_CAPABILITY: &str = "health_check";
 pub const HEALTH_PING_KIND: &str = "endpoint.health.ping.v1";
 pub const HEALTH_PONG_KIND: &str = "endpoint.health.pong.v1";
-/// Server can mint an SSH-bootstrapped QUIC endpoint for remote clients.
-pub const REMOTE_QUIC_CAPABILITY: &str = "remote_quic";
 /// Client-local transport state injected by the local QUIC bridge toward the
 /// thin client. Never sent to or by a server.
 pub const TRANSPORT_STATUS_KIND: &str = "endpoint.transport.status.v1";

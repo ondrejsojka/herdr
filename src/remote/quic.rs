@@ -302,6 +302,7 @@ impl PathMonitor {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn state(&self) -> PathState {
         self.state
     }
@@ -491,6 +492,7 @@ impl QuicSession {
         self.endpoint.close(VarInt::from_u32(code), reason);
     }
 
+    #[cfg(test)]
     pub(crate) fn connection(&self) -> &Connection {
         &self.connection
     }

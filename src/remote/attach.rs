@@ -43,10 +43,8 @@ pub(crate) fn run_remote(remote: RemoteLaunch) -> io::Result<()> {
         remote.keybindings,
         remote.live_handoff,
     );
-    let manage_ssh_config = crate::config::Config::load()
-        .config
-        .remote
-        .manage_ssh_config;
+    let remote_config = crate::config::Config::load().config.remote;
+    let manage_ssh_config = remote_config.manage_ssh_config;
     let require_surface_interest = crate::client::endpoint::EndpointCatalog::load()
         .map(|catalog| catalog.contains_enabled_target_session(&remote.target, &session_name))
         .unwrap_or(false);
@@ -65,6 +63,20 @@ pub(crate) fn run_remote(remote: RemoteLaunch) -> io::Result<()> {
         require_surface_interest,
     )?;
 
+    #[cfg(unix)]
+    let _bridge = super::quic_bridge::QuicBridge::start(
+        super::quic_bridge::QuicBridgeConfig {
+            target: remote.target,
+            remote_herdr: prepared_remote.remote_herdr,
+            session: session_name,
+            ssh_options: remote_ssh.options().cloned(),
+            noninteractive: false,
+            transport: remote_config.transport,
+            logical_client_id: super::quic_bridge::QuicBridgeConfig::process_logical_client_id(),
+        },
+        local_socket.clone(),
+    )?;
+    #[cfg(not(unix))]
     let _bridge = SshStdioBridge::start(
         remote.target,
         prepared_remote.remote_herdr,
@@ -200,6 +212,14 @@ impl RemoteHerdr {
     fn with_shell_path(mut self, shell_path: String) -> Self {
         self.shell_path = shell_path;
         self
+    }
+
+    /// A remote Herdr at an explicit path on a Linux x86_64 host, for live
+    /// loopback tests that must not touch the installed binary.
+    #[cfg(all(test, unix))]
+    pub(super) fn for_test_binary(path: &std::path::Path) -> Self {
+        let platform = RemotePlatform::from_uname("Linux", "x86_64").expect("linux platform");
+        Self::for_platform(platform).with_shell_path(shell_quote(&path.to_string_lossy()))
     }
 }
 

@@ -20,6 +20,12 @@ use support::{
     SERVER_MESSAGE_SERVER_SHUTDOWN,
 };
 
+/// Wire tag of `ClientMessage::RemoteBootstrap`, the private SSH-helper
+/// request that lazily binds the server's QUIC endpoint.
+const CLIENT_MESSAGE_REMOTE_BOOTSTRAP: u32 = 21;
+/// Wire tag of `ServerMessage::RemoteBootstrap`, its reply.
+const SERVER_MESSAGE_REMOTE_BOOTSTRAP: u32 = 21;
+
 struct SpawnedHerdr {
     _master: Box<dyn MasterPty + Send>,
     child: Box<dyn Child + Send + Sync>,
@@ -281,6 +287,141 @@ fn assert_ok(response: serde_json::Value) {
         response.get("result").is_some(),
         "api request failed: {response}"
     );
+}
+
+/// The QUIC authority a client pins: instance id, port, and certificate. A
+/// live handoff must keep all three so a remote client reconnects with the
+/// capability it already holds instead of re-running the SSH bootstrap.
+#[derive(Debug, PartialEq, Eq)]
+struct BootstrapAuthority {
+    server_instance_id: [u8; 16],
+    port: u16,
+    certificate_fingerprint: [u8; 32],
+    capability_token: [u8; 32],
+}
+
+/// Speaks the private `ClientMessage::RemoteBootstrap` handshake the SSH helper
+/// uses, which is what lazily binds the server's QUIC endpoint.
+fn remote_bootstrap(client_socket: &Path) -> Result<BootstrapAuthority, String> {
+    let mut stream = UnixStream::connect(client_socket).map_err(|err| err.to_string())?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .map_err(|err| err.to_string())?;
+
+    // ClientMessage::RemoteBootstrap is variant 21; the request is a session
+    // name and a 16-byte logical client id.
+    let session = "default";
+    let mut payload = support::encode_varint_u32(CLIENT_MESSAGE_REMOTE_BOOTSTRAP);
+    payload.extend_from_slice(&support::encode_varint_u32(session.len() as u32));
+    payload.extend_from_slice(session.as_bytes());
+    payload.extend_from_slice(&[7u8; 16]);
+    stream
+        .write_all(&support::frame_message(&payload))
+        .map_err(|err| err.to_string())?;
+    stream.flush().map_err(|err| err.to_string())?;
+
+    let (variant, body) = support::read_server_message(&mut stream)?;
+    if variant != SERVER_MESSAGE_REMOTE_BOOTSTRAP {
+        return Err(format!(
+            "expected RemoteBootstrap reply, got variant {variant}"
+        ));
+    }
+    let mut offset = 0;
+    let record_tag = *body.get(offset).ok_or("reply too short for record tag")?;
+    offset += 1;
+    if record_tag != 1 {
+        let error_tag = *body.get(offset).ok_or("reply too short for error tag")?;
+        offset += 1;
+        if error_tag != 1 {
+            return Err("bootstrap reply carried neither record nor error".to_owned());
+        }
+        let (len, consumed) = support::decode_varint_u32(&body, offset)?;
+        offset += consumed;
+        let end = offset + len as usize;
+        let message = body
+            .get(offset..end)
+            .ok_or("reply too short for error text")?;
+        return Err(String::from_utf8_lossy(message).into_owned());
+    }
+
+    let (_schema_version, consumed) = support::decode_varint_u32(&body, offset)?;
+    offset += consumed;
+    let server_instance_id: [u8; 16] = body
+        .get(offset..offset + 16)
+        .ok_or("reply too short for instance id")?
+        .try_into()
+        .map_err(|_| "instance id was not 16 bytes".to_owned())?;
+    offset += 16;
+    let (port, consumed) = support::decode_varint_u32(&body, offset)?;
+    offset += consumed;
+    let certificate_fingerprint: [u8; 32] = body
+        .get(offset..offset + 32)
+        .ok_or("reply too short for certificate fingerprint")?
+        .try_into()
+        .map_err(|_| "fingerprint was not 32 bytes".to_owned())?;
+    offset += 32;
+    let capability_token: [u8; 32] = body
+        .get(offset..offset + 32)
+        .ok_or("reply too short for capability token")?
+        .try_into()
+        .map_err(|_| "capability token was not 32 bytes".to_owned())?;
+
+    Ok(BootstrapAuthority {
+        server_instance_id,
+        port: u16::try_from(port).map_err(|_| "port did not fit in u16".to_owned())?,
+        certificate_fingerprint,
+        capability_token,
+    })
+}
+
+#[test]
+fn live_handoff_keeps_the_quic_authority_remote_clients_pinned() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+    let client_socket = runtime_dir.join("herdr-client.sock");
+
+    let spawned = spawn_server(&config_home, &runtime_dir, &api_socket);
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    register_runtime_dir(&runtime_dir);
+    wait_for_socket(&client_socket, Duration::from_secs(10));
+
+    let before = remote_bootstrap(&client_socket).expect("bootstrap before handoff");
+
+    assert_ok(request(
+        &api_socket,
+        serde_json::json!({"id":"test:handoff","method":"server.live_handoff","params":{}}),
+    ));
+    drop(spawned);
+    wait_for_api(&api_socket, Duration::from_secs(10));
+    wait_for_socket(&client_socket, Duration::from_secs(10));
+
+    let after = remote_bootstrap(&client_socket).expect("bootstrap after handoff");
+
+    assert_eq!(
+        after.server_instance_id, before.server_instance_id,
+        "successor must keep the instance id clients validate against"
+    );
+    assert_eq!(
+        after.certificate_fingerprint, before.certificate_fingerprint,
+        "successor must keep the certificate clients pinned"
+    );
+    assert_eq!(
+        after.port, before.port,
+        "successor must keep serving the inherited UDP port"
+    );
+    assert_ne!(
+        after.capability_token, before.capability_token,
+        "each bootstrap should still mint a fresh capability"
+    );
+
+    let _ = request(
+        &api_socket,
+        serde_json::json!({"id":"test:stop","method":"server.stop","params":{}}),
+    );
+    cleanup_test_base(&base);
 }
 
 fn wait_for_api(socket_path: &Path, timeout: Duration) {

@@ -14,7 +14,6 @@
 //! the local socket is closed. The server saw an ordinary client connection,
 //! so resuming needs a fresh `Hello` and only the thin client's supervisor can
 //! send one; its next connection reuses the cached credential and skips SSH.
-#![allow(dead_code)] // scaffold: wired into the endpoint seam in the next phase
 
 use std::collections::{HashMap, HashSet};
 use std::io;
@@ -86,9 +85,6 @@ pub(crate) const TRANSPORT_STATE_LIVE: &str = "live";
 /// The QUIC path is silent but not yet abandoned: the thin client stretches its
 /// heartbeat deadline to the roaming grace and shows roaming, not reconnecting.
 pub(crate) const TRANSPORT_STATE_RECOVERING: &str = "recovering";
-/// The connection is carried by the SSH stdio bridge, which has no roaming
-/// grace: the client keeps its ordinary heartbeat deadline.
-pub(crate) const TRANSPORT_STATE_SSH: &str = "ssh";
 
 pub(crate) struct QuicBridgeConfig {
     pub target: String,
@@ -98,6 +94,32 @@ pub(crate) struct QuicBridgeConfig {
     pub noninteractive: bool,
     pub transport: RemoteTransportConfig,
     pub logical_client_id: [u8; REMOTE_QUIC_ID_BYTES],
+}
+
+impl QuicBridgeConfig {
+    /// One logical client per process: the token a bootstrap mints is scoped
+    /// to it, and every local connection this process's bridges accept
+    /// reconnects as the same logical client with a newer generation.
+    pub(crate) fn process_logical_client_id() -> [u8; REMOTE_QUIC_ID_BYTES] {
+        static ID: LazyLock<[u8; REMOTE_QUIC_ID_BYTES]> = LazyLock::new(|| {
+            let mut id = [0u8; REMOTE_QUIC_ID_BYTES];
+            if let Err(err) = getrandom::fill(&mut id) {
+                // Fall back to process identity: the id only namespaces the
+                // token; the token itself is the secret.
+                warn!(%err, "system randomness unavailable for the remote client id");
+                let pid = std::process::id().to_le_bytes();
+                let nanos = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos()
+                    .to_le_bytes();
+                id[..4].copy_from_slice(&pid);
+                id[4..].copy_from_slice(&nanos[..12]);
+            }
+            id
+        });
+        *ID
+    }
 }
 
 /// Listener owning the local socket the thin client attaches to. Same shape as
@@ -1057,6 +1079,123 @@ mod tests {
         ("fedora".to_owned(), "default".to_owned())
     }
 
+    /// End to end over the real machinery: `ssh localhost` runs this build's
+    /// `remote-quic-bootstrap` in a throwaway named session (starting that
+    /// session's server daemon), the bridge dials QUIC with the minted
+    /// credential, and a thin client handshake completes through the pipe.
+    /// Needs passwordless `ssh localhost`; never touches the default session.
+    #[test]
+    #[ignore = "live: needs passwordless ssh localhost and a built target/debug/herdr"]
+    fn live_loopback_quic_bridge_carries_a_client_handshake() {
+        use std::process::Command;
+
+        let herdr = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/herdr");
+        assert!(herdr.is_file(), "build herdr first: {}", herdr.display());
+        let session = format!("quicrepro-{}", std::process::id());
+        let stop_session = || {
+            let _ = Command::new(&herdr)
+                .args(["--session", &session, "server", "stop"])
+                .env_remove("HERDR_SOCKET_PATH")
+                .env_remove("HERDR_CLIENT_SOCKET_PATH")
+                .env_remove(crate::session::SESSION_ENV_VAR)
+                .output();
+        };
+
+        let remote_herdr = RemoteHerdr::for_test_binary(&herdr);
+
+        // Capture this test's tracing so the assertion below can tell a QUIC
+        // handshake from a silent SSH fallback.
+        #[derive(Clone, Default)]
+        struct Log(Arc<Mutex<Vec<u8>>>);
+        impl io::Write for Log {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                lock(&self.0).extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let log = Log::default();
+        let writer = log.clone();
+        // Global, not thread-local: the bridge logs from its accept thread
+        // and the pump runtime. Fails only if another test installed one.
+        tracing::subscriber::set_global_default(
+            tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::DEBUG)
+                .with_writer(move || writer.clone())
+                .finish(),
+        )
+        .expect("live test owns the global tracing subscriber");
+        let local_socket = std::env::temp_dir().join(format!("herdr-quic-live-{}.sock", session));
+        let bridge = QuicBridge::start(
+            QuicBridgeConfig {
+                target: "localhost".to_owned(),
+                remote_herdr,
+                session: session.clone(),
+                ssh_options: None,
+                noninteractive: true,
+                transport: RemoteTransportConfig::Auto,
+                logical_client_id: QuicBridgeConfig::process_logical_client_id(),
+            },
+            local_socket.clone(),
+        )
+        .expect("bridge starts");
+
+        let result = std::panic::catch_unwind(|| {
+            let mut client = std::os::unix::net::UnixStream::connect(&local_socket)
+                .expect("connect to bridge socket");
+            client
+                .set_read_timeout(Some(Duration::from_secs(60)))
+                .expect("read timeout");
+            crate::protocol::write_message(
+                &mut client,
+                &ClientMessage::TerminalHello {
+                    version: crate::protocol::PROTOCOL_VERSION,
+                    cols: 80,
+                    rows: 24,
+                    cell_width_px: 8,
+                    cell_height_px: 16,
+                    pixel_mouse: false,
+                },
+            )
+            .expect("write hello");
+            let welcome: ServerMessage =
+                read_message(&mut client, crate::protocol::MAX_FRAME_SIZE).expect("read welcome");
+            assert!(
+                matches!(welcome, ServerMessage::Welcome { error: None, .. }),
+                "{welcome:?}"
+            );
+            let cached = lock(&CREDENTIAL_CACHE)
+                .get(&("localhost".to_owned(), session.clone()))
+                .map(|credential| credential.record.port);
+            assert!(
+                cached.is_some(),
+                "no QUIC credential was cached, so the handshake ran over SSH"
+            );
+            let log = String::from_utf8_lossy(&lock(&log.0)).into_owned();
+            assert!(
+                log.contains("remote QUIC transport connected"),
+                "handshake did not run over QUIC:\n{log}"
+            );
+            assert!(
+                !log.contains("carrying the remote client on the SSH stdio bridge"),
+                "bridge fell back to SSH:\n{log}"
+            );
+            eprintln!(
+                "QUIC credential minted for UDP port {}",
+                cached.unwrap_or(0)
+            );
+        });
+
+        drop(bridge);
+        stop_session();
+        let _ = std::fs::remove_file(&local_socket);
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
+    }
+
     #[test]
     fn unreachable_paths_hand_the_connection_to_ssh() {
         let mut state = LadderState::default();
@@ -1298,11 +1437,7 @@ mod tests {
 
     #[test]
     fn the_injected_status_frame_is_a_readable_server_control() {
-        for state in [
-            TRANSPORT_STATE_LIVE,
-            TRANSPORT_STATE_RECOVERING,
-            TRANSPORT_STATE_SSH,
-        ] {
+        for state in [TRANSPORT_STATE_LIVE, TRANSPORT_STATE_RECOVERING] {
             let payload = transport_status_frame(state).expect("encode");
             let mut framed = Vec::new();
             framed.extend_from_slice(&(payload.len() as u32).to_le_bytes());

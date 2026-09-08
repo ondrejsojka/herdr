@@ -57,6 +57,7 @@ pub fn run_server() -> io::Result<()> {
         let mut server = match HeadlessServer::new(
             app,
             &loaded_config.diagnostics,
+            loaded_config.config.remote.clone(),
             Some(api_tx.clone()),
             Some(_api_server),
             should_quit,
@@ -126,6 +127,20 @@ fn run_handoff_import_server(socket_path: &Path, token: &str) -> io::Result<()> 
     let event_hub = api::EventHub::default();
     let should_quit = Arc::new(AtomicBool::new(false));
 
+    // Pane PTYs come first in the handoff fd list; the QUIC sockets follow.
+    let pane_fd_count = received.manifest.panes.len().min(received.fds.len());
+    let remote_quic_state = received.manifest.remote_quic.take();
+    let remote_quic_sockets = received
+        .fds
+        .split_off(pane_fd_count)
+        .into_iter()
+        .map(|fd| {
+            std::net::UdpSocket::from(unsafe {
+                <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(fd)
+            })
+        })
+        .collect::<Vec<_>>();
+
     let mut imports = HashMap::new();
     for (pane, fd) in received.manifest.panes.into_iter().zip(received.fds) {
         let pane_id = pane.pane_id;
@@ -168,6 +183,7 @@ fn run_handoff_import_server(socket_path: &Path, token: &str) -> io::Result<()> 
         let mut server = HeadlessServer::new(
             app,
             &loaded_config.diagnostics,
+            loaded_config.config.remote.clone(),
             Some(api_tx.clone()),
             Some(api_server),
             should_quit,
@@ -180,6 +196,28 @@ fn run_handoff_import_server(socket_path: &Path, token: &str) -> io::Result<()> 
         server.app.assume_handoff_ownership();
         server.app.unpause_handoff_readers();
         server.pending_handoff_repaint_nudge = true;
+        // Resumed after the commit: the predecessor closes its endpoints on
+        // the same sockets first, so only one process ever reads them.
+        if let Some(state) = remote_quic_state {
+            let sockets = remote_quic_sockets.len();
+            let sink = server.remote_quic_sink();
+            match crate::server::remote_quic::RemoteQuicServer::resume(
+                &loaded_config.config.remote,
+                crate::session::active_name()
+                    .unwrap_or_else(|| crate::session::DEFAULT_SESSION_NAME.to_owned()),
+                sink,
+                state,
+                remote_quic_sockets,
+            ) {
+                Ok(quic) => {
+                    info!(sockets, port = quic.port(), "adopted the QUIC endpoint from the handoff");
+                    server.remote_quic = Some(quic);
+                }
+                Err(err) => {
+                    warn!(err = %err, "failed to adopt the handed-off QUIC endpoint; remote clients will re-bootstrap");
+                }
+            }
+        }
         if let Err(err) = crate::server::handoff::report_owned(&mut received.stream) {
             warn!(err = %err, "failed to report handoff ownership; continuing as owner");
         }

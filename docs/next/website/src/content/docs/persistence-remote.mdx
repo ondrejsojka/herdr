@@ -71,6 +71,14 @@ Remote attach supports Linux, macOS, and Windows local clients connecting to Lin
 
 By default, `herdr --remote` runs remote setup and the bridge through a temporary SSH config that includes your SSH config first, then adds fallback keepalive settings. Existing user keepalive settings win. Linux and macOS clients also use a private per-attach control socket for connection reuse; Windows OpenSSH does not. Set `[remote].manage_ssh_config = false` to use plain `ssh` without Herdr's generated config or control socket.
 
+### Roaming over QUIC
+
+On Linux and macOS clients, `herdr --remote` and saved SSH machines carry the live session over an SSH-bootstrapped QUIC connection when the remote server supports it. SSH still authenticates you, verifies the host, and installs or starts the remote server; it then mints a short-lived credential and a pinned certificate fingerprint, and the client dials the remote server directly over UDP. The SSH stdio bridge remains the fallback whenever UDP is blocked, the remote server is a build without QUIC support, or `[remote].transport = "ssh"` is set on either side.
+
+With QUIC, changing networks, riding through a tunnel, or closing the laptop no longer drops the session. While the path is silent the machine shows `roaming` instead of `reconnecting`, the screen stays live, and input keeps flowing; the client rebinds its socket as addresses change and gives up only after 150 seconds of silence. If the connection is truly lost, the client reconnects with the cached credential instead of re-running SSH, and a live server handoff (`--handoff`) carries the credential to the successor.
+
+The remote server binds one UDP port from `[remote].quic_port_range` (default `48000-48100`) the first time a QUIC client bootstraps; servers that never see a QUIC client bind nothing. Open that range on firewalls between you and the host, or leave it closed to stay on SSH. Search `remote.` in the [Config reference](/docs/config-reference/) for every transport setting.
+
 Remote attach uses your normal OpenSSH authentication. If the target uses a passphrase-protected key in a non-interactive shell, script, CI job, or mobile terminal that cannot show the passphrase prompt, load the key into ssh-agent first:
 
 ```bash

@@ -1432,10 +1432,38 @@
       "title": "Remote",
       "keys": [
         {
+          "key": "remote.transport",
+          "type": "string",
+          "default": "\"auto\"",
+          "description": "Live transport for remote clients. `auto` bootstraps a QUIC connection over SSH when the remote server offers one and falls back to the SSH stdio bridge otherwise; `ssh` never bootstraps or dials QUIC.",
+          "values": [
+            "auto",
+            "ssh"
+          ]
+        },
+        {
           "key": "remote.manage_ssh_config",
           "type": "boolean",
           "default": "true",
           "description": "Add keepalive fallbacks and private connection reuse for `herdr --remote`. Set false to run plain ssh unchanged."
+        },
+        {
+          "key": "remote.quic_port_range",
+          "type": "string",
+          "default": "\"48000-48100\"",
+          "description": "Inclusive unprivileged UDP port range the remote server binds for its lazily started QUIC listener."
+        },
+        {
+          "key": "remote.quic_idle_timeout_seconds",
+          "type": "integer",
+          "default": "86400",
+          "description": "How long an SSH-minted QUIC credential stays valid for fresh reconnects without re-running SSH."
+        },
+        {
+          "key": "remote.quic_transport_idle_timeout_seconds",
+          "type": "integer",
+          "default": "180",
+          "description": "How long a silent QUIC connection is kept before the server declares it dead (10-600). Keep it above the client's 150-second roaming grace so a long blackhole migrates instead of reconnecting."
         }
       ]
     },

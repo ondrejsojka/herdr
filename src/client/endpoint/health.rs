@@ -2,6 +2,11 @@ use std::time::{Duration, Instant};
 
 pub(super) const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 pub(super) const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Probe deadline while the endpoint's transport reports its path as
+/// recovering (a QUIC connection riding out a blackhole or an address change).
+/// Long enough to cover a tunnel; the transport itself gives up at the same
+/// bound, so the endpoint never sits in this state indefinitely.
+pub(super) const ROAMING_GRACE: Duration = Duration::from_secs(150);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum HealthAction {
@@ -15,6 +20,7 @@ pub(super) struct EndpointHealth {
     last_received: Instant,
     ping_sent_at: Option<Instant>,
     ready: bool,
+    recovering: bool,
 }
 
 impl EndpointHealth {
@@ -24,7 +30,14 @@ impl EndpointHealth {
             last_received: now,
             ping_sent_at: None,
             ready: false,
+            recovering: false,
         }
+    }
+
+    /// The local transport says the path is recovering, not lost: keep the
+    /// endpoint online and stretch the probe deadline to the roaming grace.
+    pub(super) fn set_recovering(&mut self, recovering: bool) {
+        self.recovering = recovering;
     }
 
     pub(super) fn received(&mut self, now: Instant) {
@@ -39,9 +52,14 @@ impl EndpointHealth {
     pub(super) fn action(&self, now: Instant) -> HealthAction {
         let initial_snapshot_expired =
             !self.ready && now.saturating_duration_since(self.connected_at) >= HEARTBEAT_TIMEOUT;
+        let probe_timeout = if self.recovering {
+            ROAMING_GRACE
+        } else {
+            HEARTBEAT_TIMEOUT
+        };
         let probe_expired = self
             .ping_sent_at
-            .is_some_and(|sent_at| now.saturating_duration_since(sent_at) >= HEARTBEAT_TIMEOUT);
+            .is_some_and(|sent_at| now.saturating_duration_since(sent_at) >= probe_timeout);
         if initial_snapshot_expired || probe_expired {
             HealthAction::Expired
         } else if self.ping_sent_at.is_none()
@@ -83,6 +101,27 @@ mod tests {
         health.ping_sent(now);
         health.received(now + HEARTBEAT_TIMEOUT - Duration::from_millis(1));
         assert_eq!(health.action(now + HEARTBEAT_TIMEOUT), HealthAction::None);
+    }
+
+    #[test]
+    fn a_recovering_path_stretches_the_probe_deadline_to_the_roaming_grace() {
+        let now = Instant::now();
+        let mut health = EndpointHealth::new(now);
+        health.ready();
+        health.set_recovering(true);
+        health.ping_sent(now);
+        assert_eq!(health.action(now + HEARTBEAT_TIMEOUT), HealthAction::None);
+        assert_eq!(
+            health.action(now + ROAMING_GRACE - Duration::from_millis(1)),
+            HealthAction::None
+        );
+        assert_eq!(health.action(now + ROAMING_GRACE), HealthAction::Expired);
+
+        health.set_recovering(false);
+        assert_eq!(
+            health.action(now + HEARTBEAT_TIMEOUT),
+            HealthAction::Expired
+        );
     }
 
     #[test]

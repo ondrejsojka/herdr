@@ -44,6 +44,23 @@ pub(crate) struct HandoffManifest {
     /// Absent from manifests written before this field existed.
     #[serde(default)]
     pub api_window_title: Option<String>,
+    /// Live QUIC transport state. Carrying it means remote clients reconnect
+    /// to the successor with the capability they already hold instead of
+    /// running a fresh SSH bootstrap. Absent from manifests written before
+    /// this field existed and from servers that never bound a QUIC endpoint.
+    #[serde(default)]
+    pub remote_quic: Option<crate::server::remote_quic::RemoteQuicHandoffState>,
+}
+
+#[cfg(unix)]
+impl HandoffManifest {
+    /// Number of trailing fds in the handoff that belong to the QUIC endpoint
+    /// rather than to a pane PTY. Pane fds come first, then these.
+    pub(crate) fn remote_quic_fd_count(&self) -> usize {
+        self.remote_quic
+            .as_ref()
+            .map_or(0, |state| usize::from(state.socket_fd_count))
+    }
 }
 
 #[cfg(unix)]
@@ -265,9 +282,21 @@ pub(crate) fn receive(socket_path: &Path, token: &str) -> io::Result<ReceivedHan
             crate::build_info::version()
         )));
     }
+    // The QUIC sockets ride the same SCM_RIGHTS message as the pane PTYs, so
+    // the receive has to be sized by pane count plus socket count:
+    // undercounting silently loses the sockets and leaks their fds.
+    let expected_fds = manifest
+        .panes
+        .len()
+        .saturating_add(manifest.remote_quic_fd_count());
+    if expected_fds > MAX_FDS_PER_HANDOFF {
+        return Err(io::Error::other(format!(
+            "handoff manifest describes {expected_fds} fds, more than the {MAX_FDS_PER_HANDOFF} a handoff carries"
+        )));
+    }
     stream.write_all(b"validated\n")?;
     stream.flush()?;
-    let fds = recv_fds(&stream, manifest.panes.len())?;
+    let fds = recv_fds(&stream, expected_fds)?;
     Ok(ReceivedHandoff {
         manifest,
         fds,
@@ -310,6 +339,7 @@ pub(crate) fn manifest_for(
     expected_protocol: Option<u32>,
     expected_version: Option<String>,
     api_window_title: Option<String>,
+    remote_quic: Option<crate::server::remote_quic::RemoteQuicHandoffState>,
 ) -> HandoffManifest {
     HandoffManifest {
         version: HANDOFF_VERSION,
@@ -320,6 +350,7 @@ pub(crate) fn manifest_for(
         snapshot,
         panes,
         api_window_title,
+        remote_quic,
     }
 }
 
@@ -488,6 +519,25 @@ mod tests {
         }
     }
 
+    fn quic_state() -> crate::server::remote_quic::RemoteQuicHandoffState {
+        crate::server::remote_quic::RemoteQuicHandoffState {
+            server_instance_id: [7u8; crate::protocol::REMOTE_QUIC_ID_BYTES],
+            certificate_der: vec![1, 2, 3],
+            private_key_der: vec![4, 5, 6],
+            certificate_fingerprint: [9u8; crate::protocol::REMOTE_QUIC_HASH_BYTES],
+            port: 48123,
+            socket_fd_count: 2,
+            tokens: vec![crate::server::remote_quic::HandoffToken {
+                token_hash: [3u8; crate::protocol::REMOTE_QUIC_HASH_BYTES],
+                session: "default".to_owned(),
+                logical_client_id: [4u8; crate::protocol::REMOTE_QUIC_ID_BYTES],
+                expires_unix_seconds: 1_700_000_000,
+                connection_generation: 5,
+                issued_order: 11,
+            }],
+        }
+    }
+
     #[test]
     fn a_handoff_carries_an_api_set_window_title() {
         let manifest = manifest_for(
@@ -496,9 +546,79 @@ mod tests {
             None,
             None,
             Some("deploying".to_string()),
+            None,
         );
 
         assert_eq!(manifest.api_window_title.as_deref(), Some("deploying"));
+        assert_eq!(manifest.remote_quic_fd_count(), 0);
+    }
+
+    #[test]
+    fn a_handoff_round_trips_live_quic_transport_state() {
+        let manifest = manifest_for(
+            empty_snapshot(),
+            Vec::new(),
+            None,
+            None,
+            None,
+            Some(quic_state()),
+        );
+        assert_eq!(manifest.remote_quic_fd_count(), 2);
+
+        let encoded = serde_json::to_string(&manifest).expect("manifest should serialize");
+        let decoded: HandoffManifest =
+            serde_json::from_str(&encoded).expect("manifest should deserialize");
+
+        assert_eq!(decoded.remote_quic_fd_count(), 2);
+        let restored = decoded.remote_quic.expect("quic state should survive");
+        let expected = quic_state();
+        assert_eq!(restored.server_instance_id, expected.server_instance_id);
+        assert_eq!(restored.certificate_der, expected.certificate_der);
+        assert_eq!(restored.private_key_der, expected.private_key_der);
+        assert_eq!(
+            restored.certificate_fingerprint,
+            expected.certificate_fingerprint
+        );
+        assert_eq!(restored.port, expected.port);
+        assert_eq!(restored.socket_fd_count, expected.socket_fd_count);
+        assert_eq!(restored.tokens.len(), 1);
+        let token = &restored.tokens[0];
+        let expected_token = &expected.tokens[0];
+        assert_eq!(token.token_hash, expected_token.token_hash);
+        assert_eq!(token.session, expected_token.session);
+        assert_eq!(token.logical_client_id, expected_token.logical_client_id);
+        assert_eq!(
+            token.expires_unix_seconds,
+            expected_token.expires_unix_seconds
+        );
+        assert_eq!(
+            token.connection_generation,
+            expected_token.connection_generation
+        );
+        assert_eq!(token.issued_order, expected_token.issued_order);
+    }
+
+    #[test]
+    fn a_manifest_written_before_the_quic_field_still_loads() {
+        let manifest = manifest_for(
+            empty_snapshot(),
+            Vec::new(),
+            None,
+            None,
+            None,
+            Some(quic_state()),
+        );
+        let mut value = serde_json::to_value(&manifest).expect("manifest should serialize");
+        value
+            .as_object_mut()
+            .expect("manifest should be a json object")
+            .remove("remote_quic");
+
+        let older: HandoffManifest =
+            serde_json::from_value(value).expect("an older manifest should still load");
+
+        assert!(older.remote_quic.is_none());
+        assert_eq!(older.remote_quic_fd_count(), 0);
     }
 
     #[test]
@@ -509,6 +629,7 @@ mod tests {
             None,
             None,
             Some("deploying".to_string()),
+            None,
         );
         let mut value = serde_json::to_value(&manifest).expect("manifest should serialize");
         value
@@ -520,5 +641,54 @@ mod tests {
             serde_json::from_value(value).expect("an older manifest should still load");
 
         assert!(older.api_window_title.is_none());
+    }
+
+    /// The QUIC sockets ride the same SCM_RIGHTS message as the pane PTYs, so
+    /// the importer has to size the receive by pane count plus socket count.
+    /// Undercounting silently loses the sockets and leaks their fds.
+    #[test]
+    fn a_handoff_delivers_the_quic_sockets_after_the_pane_fds() {
+        let dir = std::env::temp_dir().join(format!("herdr-handoff-fds-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let socket_path = dir.join("handoff.sock");
+        let listener = bind_listener(&socket_path).expect("bind handoff listener");
+        let manifest = manifest_for(
+            empty_snapshot(),
+            Vec::new(),
+            None,
+            None,
+            None,
+            Some(quic_state()),
+        );
+
+        let source_path = socket_path.clone();
+        let source = std::thread::spawn(move || {
+            let mut stream = accept_and_validate_on(listener, &source_path, "token", &manifest)?;
+            // Two placeholder sockets stand in for the IPv4/IPv6 endpoints.
+            let first = UnixStream::pair()?;
+            let second = UnixStream::pair()?;
+            let fds = [first.0.as_raw_fd(), second.0.as_raw_fd()];
+            send_fds_and_wait_restored(&mut stream, &fds)
+        });
+
+        let mut received = receive(&socket_path, "token").expect("receive handoff");
+        assert_eq!(received.manifest.panes.len(), 0);
+        assert_eq!(received.manifest.remote_quic_fd_count(), 2);
+        assert_eq!(
+            received.fds.len(),
+            2,
+            "both QUIC sockets should arrive even with no panes"
+        );
+        report_restored(&mut received.stream).expect("report restored");
+        source
+            .join()
+            .expect("handoff source thread")
+            .expect("handoff source should complete");
+
+        for fd in received.fds {
+            let _ = unsafe { libc::close(fd) };
+        }
+        let _ = std::fs::remove_file(&socket_path);
+        let _ = std::fs::remove_dir(&dir);
     }
 }

@@ -6,11 +6,6 @@
 //! the server render, input, and session paths are byte-for-byte the ones a
 //! local Unix client drives.
 
-// scaffold: nothing constructs a `RemoteQuicServer` until the endpoint seam is
-// wired up in the next phase, so this surface is currently reachable only from
-// this module's tests.
-#![allow(dead_code)]
-
 use std::collections::HashMap;
 use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
@@ -259,6 +254,11 @@ impl RemoteQuicServer {
             token_lifetime: token_lifetime(config),
             handed_off: AtomicBool::new(false),
         })
+    }
+
+    /// UDP port the endpoint listens on.
+    pub(crate) fn port(&self) -> u16 {
+        self.port
     }
 
     /// Mints one capability for the session this server owns. The plaintext

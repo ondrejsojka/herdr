@@ -1063,9 +1063,12 @@ impl Default for RemoteConfig {
 /// Below 10s a normal stall on a mobile path would tear the connection down
 /// faster than the client can probe it; above 600s a dead peer would hold
 /// server-side state for ten minutes.
+#[cfg(unix)]
 pub const REMOTE_TRANSPORT_IDLE_TIMEOUT_MIN_SECONDS: u64 = 10;
+#[cfg(unix)]
 pub const REMOTE_TRANSPORT_IDLE_TIMEOUT_MAX_SECONDS: u64 = 600;
 
+#[cfg(unix)]
 impl RemoteConfig {
     /// Clamp `remote.quic_transport_idle_timeout_seconds` into the supported
     /// window instead of letting a typo produce a transport that never times

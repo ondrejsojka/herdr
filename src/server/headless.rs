@@ -48,7 +48,7 @@ use crate::protocol::{
 };
 #[cfg(unix)]
 use crate::server::client_accept::{
-    accept_pending_client_connections, reject_pending_client_connections,
+    accept_pending_client_connections, adopt_remote_quic_client, reject_pending_client_connections,
 };
 use crate::server::client_shell::{
     render_pane_surface as render_client_shell_pane_surface, snapshot as client_shell_snapshot,
@@ -248,6 +248,16 @@ pub struct HeadlessServer {
     /// Imported panes get one app-safe resize nudge after the first client attaches.
     #[cfg(unix)]
     pending_handoff_repaint_nudge: bool,
+    /// Lazily started SSH-bootstrapped QUIC endpoint for remote clients.
+    /// `None` until the first bootstrap request, so a server no remote client
+    /// ever asks never binds UDP or mints TLS material.
+    #[cfg(unix)]
+    remote_quic: Option<crate::server::remote_quic::RemoteQuicServer>,
+    /// `[remote]` config captured when the server started. Bootstrap requests
+    /// arrive on the event loop, so reading the config file there would stall
+    /// rendering for every connected client.
+    #[cfg(unix)]
+    remote_config: crate::config::RemoteConfig,
     /// Flag set by Ctrl+C or `server stop` signal.
     should_quit: Arc<AtomicBool>,
     /// Channel for receiving server events from client connection threads.
@@ -311,6 +321,7 @@ impl HeadlessServer {
     pub fn new(
         app: app::App,
         config_diagnostics: &[String],
+        remote_config: crate::config::RemoteConfig,
         api_tx: Option<api::ApiRequestSender>,
         api_server: Option<api::ServerHandle>,
         should_quit: Arc<AtomicBool>,
@@ -337,7 +348,7 @@ impl HeadlessServer {
         let (server_config_diagnostic, server_config_diagnostic_without_keybindings) =
             server_config_diagnostic_summaries(config_diagnostics);
         #[cfg(not(unix))]
-        let _ = api_tx;
+        let _ = (api_tx, remote_config);
         Ok(Self {
             app,
             #[cfg(unix)]
@@ -376,6 +387,10 @@ impl HeadlessServer {
             handoff_in_progress: false,
             #[cfg(unix)]
             pending_handoff_repaint_nudge: false,
+            #[cfg(unix)]
+            remote_quic: None,
+            #[cfg(unix)]
+            remote_config,
             should_quit,
             server_event_rx,
             server_event_tx,
@@ -1887,6 +1902,11 @@ impl HeadlessServer {
     /// Handles a server event. Returns true if the event requires a re-render.
     fn handle_server_event(&mut self, ev: ServerEvent) -> bool {
         if self.handoff_in_progress && Self::ignore_client_event_during_handoff(&ev) {
+            if let ServerEvent::RemoteBootstrap { respond_to, .. } = &ev {
+                let _ = respond_to.send(Err(
+                    "live update in progress; retry QUIC bootstrap after handoff".to_owned(),
+                ));
+            }
             return false;
         }
 
@@ -2628,6 +2648,30 @@ impl HeadlessServer {
                 };
                 client.take_deferred_render() != DeferredRender::None
             }
+            ServerEvent::RemoteBootstrap {
+                request,
+                respond_to,
+            } => {
+                #[cfg(unix)]
+                let result = self.remote_quic_bootstrap(&request);
+                #[cfg(not(unix))]
+                let result = {
+                    let _ = request;
+                    Err("remote QUIC transport is not supported on this platform".to_owned())
+                };
+                let _ = respond_to.send(result);
+                false
+            }
+            #[cfg(unix)]
+            ServerEvent::RemoteQuicClient { stream } => {
+                adopt_remote_quic_client(
+                    stream,
+                    &mut self.next_client_id,
+                    &self.should_quit,
+                    &self.server_event_tx,
+                );
+                false
+            }
             ServerEvent::QuitSignal => {
                 // The quit check at the top of the loop handles this.
                 // No render needed — the next iteration will initiate shutdown.
@@ -2654,6 +2698,47 @@ impl HeadlessServer {
                 | ServerEvent::ClientWriterDrained { .. }
                 | ServerEvent::QuitSignal
         )
+    }
+
+    /// Sink handing an accepted QUIC client's socketpair end to the ordinary
+    /// client acceptor on the event loop. Shared by the lazy bootstrap start
+    /// and by the handoff import that resumes an inherited endpoint.
+    #[cfg(unix)]
+    fn remote_quic_sink(&self) -> crate::server::remote_quic::AcceptedClientSink {
+        let server_event_tx = self.server_event_tx.clone();
+        Arc::new(move |stream: std::os::unix::net::UnixStream| {
+            if let Err(err) = server_event_tx.try_send(ServerEvent::RemoteQuicClient { stream }) {
+                warn!(%err, "dropping accepted remote QUIC client; event queue is full");
+            }
+        })
+    }
+
+    /// Mint a QUIC credential for an SSH-authenticated bootstrap helper,
+    /// starting the endpoint on first use.
+    #[cfg(unix)]
+    fn remote_quic_bootstrap(
+        &mut self,
+        request: &crate::protocol::RemoteBootstrapRequest,
+    ) -> Result<crate::protocol::RemoteBootstrapRecord, String> {
+        if self.remote_config.transport == crate::config::RemoteTransportConfig::Ssh {
+            return Err("remote.transport is set to ssh on the server".to_owned());
+        }
+        if self.remote_quic.is_none() {
+            let sink = self.remote_quic_sink();
+            let server = crate::server::remote_quic::RemoteQuicServer::start(
+                &self.remote_config,
+                crate::session::active_name()
+                    .unwrap_or_else(|| crate::session::DEFAULT_SESSION_NAME.to_owned()),
+                sink,
+            )
+            .map_err(|err| format!("failed to start remote QUIC endpoint: {err}"))?;
+            info!(port = server.port(), "remote QUIC endpoint listening");
+            self.remote_quic = Some(server);
+        }
+        let Some(server) = self.remote_quic.as_ref() else {
+            return Err("remote QUIC endpoint unavailable".to_owned());
+        };
+        server.bootstrap(request)
     }
 
     fn agent_read_not_idle_error(

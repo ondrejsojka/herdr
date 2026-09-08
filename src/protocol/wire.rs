@@ -34,6 +34,7 @@ pub const MAX_CLIPBOARD_IMAGE_PAYLOAD: usize = 16 * 1024 * 1024;
 /// Schema version of the SSH-delivered QUIC bootstrap record and of the QUIC
 /// hello. Independent of `PROTOCOL_VERSION`: client and server builds may
 /// differ, and the QUIC pipe carries whatever protocol they negotiate.
+#[cfg(unix)]
 pub const REMOTE_QUIC_SCHEMA_VERSION: u32 = 1;
 /// QUIC application protocol negotiated during the TLS handshake.
 #[cfg(unix)]

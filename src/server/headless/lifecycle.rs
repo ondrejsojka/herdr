@@ -64,6 +64,34 @@ impl HeadlessServer {
             ));
         }
 
+        // Exported before any client is disconnected so the successor inherits
+        // the UDP sockets, certificate, instance id, and live capabilities.
+        // Remote clients then reconnect with the token they already hold
+        // instead of running a fresh SSH bootstrap.
+        let (remote_quic_state, remote_quic_sockets) = match self.remote_quic.as_ref() {
+            Some(server) => match server.export_handoff() {
+                Ok((state, sockets))
+                    if pane_by_terminal.len() + sockets.len()
+                        <= crate::server::handoff::MAX_FDS_PER_HANDOFF =>
+                {
+                    (Some(state), sockets)
+                }
+                Ok((_, sockets)) => {
+                    info!(
+                        panes = pane_by_terminal.len(),
+                        quic_sockets = sockets.len(),
+                        "no room left in the handoff for the QUIC sockets; remote clients will re-bootstrap"
+                    );
+                    (None, Vec::new())
+                }
+                Err(err) => {
+                    warn!(err = %err, "failed to export QUIC handoff state; remote clients will re-bootstrap");
+                    (None, Vec::new())
+                }
+            },
+            None => (None, Vec::new()),
+        };
+
         self.handoff_in_progress = true;
         self.disconnect_all_clients_for_handoff();
         let _ = reject_pending_client_connections(&self.client_listener);
@@ -115,6 +143,7 @@ impl HeadlessServer {
             params.expected_protocol,
             params.expected_version,
             self.api_window_title.clone(),
+            remote_quic_state,
         );
         let mut import_child = match crate::server::handoff::spawn_handoff_import(
             import_exe.as_deref(),
@@ -140,6 +169,11 @@ impl HeadlessServer {
             }
             Ok::<(), io::Error>(())
         })();
+        // The QUIC sockets ride after the pane fds; the importer splits them
+        // back apart with `HandoffManifest::remote_quic_fd_count`.
+        for socket in remote_quic_sockets {
+            fds.push(std::os::fd::IntoRawFd::into_raw_fd(socket));
+        }
         if let Err(err) = duplicate_result {
             for fd in fds {
                 let _ = unsafe { libc::close(fd) };
@@ -213,6 +247,15 @@ impl HeadlessServer {
                 }
             }
             return Err(err);
+        }
+        // Committed: the successor owns the session, so the endpoints this
+        // process still holds on the inherited sockets have to go. Connected
+        // clients see a handoff close and reconnect with the capability they
+        // already hold. Every path above this point leaves the endpoint
+        // serving, so a rollback keeps remote clients connected.
+        if let Some(server) = self.remote_quic.take() {
+            server.close_for_handoff();
+            info!("closed QUIC endpoints for handoff");
         }
 
         for (terminal_id, runtime) in self.app.terminal_runtimes.drain_for_handoff() {

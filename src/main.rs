@@ -552,6 +552,9 @@ fn main() -> io::Result<()> {
     if args.get(1).map(|s| s.as_str()) == Some("remote-client-bridge") {
         return remote::run_remote_client_bridge();
     }
+    if args.get(1).map(|s| s.as_str()) == Some("remote-quic-bootstrap") {
+        return remote::run_remote_quic_bootstrap(args.get(2).map(String::as_str));
+    }
 
     if args.get(1).map(|s| s.as_str()) == Some("server") {
         return server::headless::run_server();
@@ -749,6 +752,7 @@ fn main() -> io::Result<()> {
                 "server",
                 "client",
                 "remote-client-bridge",
+                "remote-quic-bootstrap",
                 "update",
                 "status",
                 "config",

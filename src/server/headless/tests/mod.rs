@@ -85,6 +85,10 @@ fn test_headless_server_with_event_hub(event_hub: api::EventHub) -> HeadlessServ
         handoff_in_progress: false,
         #[cfg(unix)]
         pending_handoff_repaint_nudge: false,
+        #[cfg(unix)]
+        remote_quic: None,
+        #[cfg(unix)]
+        remote_config: config.remote.clone(),
         should_quit,
         server_event_rx,
         server_event_tx,
@@ -238,6 +242,75 @@ fn server_stop_interrupts_server_event_backlog() {
 
     assert!(!server.drain_server_events());
     assert!(server.server_event_rx.try_recv().is_ok());
+    shutdown_test_runtimes(&mut server);
+}
+
+/// The QUIC adapter hands headless one end of a socketpair; from there the
+/// remote client must be indistinguishable from a Unix-socket client.
+#[cfg(unix)]
+#[test]
+fn adopted_remote_quic_client_completes_an_ordinary_handshake() {
+    let mut server = test_headless_server();
+    let (server_end, mut client_end) = std::os::unix::net::UnixStream::pair().unwrap();
+    assert!(!server.handle_server_event(ServerEvent::RemoteQuicClient { stream: server_end }));
+    assert_eq!(server.next_client_id, 2);
+
+    crate::protocol::write_message(
+        &mut client_end,
+        &crate::protocol::ClientMessage::TerminalHello {
+            version: crate::protocol::PROTOCOL_VERSION,
+            cols: 80,
+            rows: 24,
+            cell_width_px: 8,
+            cell_height_px: 16,
+            pixel_mouse: false,
+        },
+    )
+    .unwrap();
+    client_end
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let welcome: ServerMessage =
+        crate::protocol::read_message(&mut client_end, crate::protocol::MAX_FRAME_SIZE).unwrap();
+    assert!(
+        matches!(welcome, ServerMessage::Welcome { error: None, .. }),
+        "{welcome:?}"
+    );
+
+    let connected = server
+        .server_event_rx
+        .blocking_recv()
+        .expect("handshake thread reports the new client");
+    assert!(
+        matches!(
+            &connected,
+            ServerEvent::ClientConnected { client_id: 1, .. }
+        ),
+        "{connected:?}"
+    );
+    server.handle_server_event(connected);
+    assert!(server.clients.contains_key(&1));
+    shutdown_test_runtimes(&mut server);
+}
+
+#[test]
+fn remote_bootstrap_is_refused_while_transport_is_ssh() {
+    let mut server = test_headless_server();
+    #[cfg(unix)]
+    {
+        server.remote_config.transport = crate::config::RemoteTransportConfig::Ssh;
+    }
+    let (respond_to, response) = std::sync::mpsc::channel();
+    assert!(!server.handle_server_event(ServerEvent::RemoteBootstrap {
+        request: crate::protocol::RemoteBootstrapRequest {
+            session: "default".to_owned(),
+            logical_client_id: [7; crate::protocol::REMOTE_QUIC_ID_BYTES],
+        },
+        respond_to,
+    }));
+    assert!(response.try_recv().unwrap().is_err());
+    #[cfg(unix)]
+    assert!(server.remote_quic.is_none());
     shutdown_test_runtimes(&mut server);
 }
 

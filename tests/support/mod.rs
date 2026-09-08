@@ -13,7 +13,7 @@ static INIT: Once = Once::new();
 static CLEANUP_GUARD: OnceLock<CleanupGuard> = OnceLock::new();
 const WATCHDOG_SCAN_INTERVAL: Duration = Duration::from_secs(1);
 const RUNTIME_OWNER_MARKER: &str = ".herdr-test-owner-pid";
-pub const CURRENT_PROTOCOL: u32 = 22;
+pub const CURRENT_PROTOCOL: u32 = 23;
 pub const CURRENT_ENDPOINT_PROTOCOL_GENERATION: u32 = 1;
 pub const SERVER_MESSAGE_SERVER_SHUTDOWN: u32 = 3;
 pub const SERVER_MESSAGE_ENDPOINT_CONTROL: u32 = 20;
@@ -115,7 +115,7 @@ pub fn wait_for_file(path: &Path, timeout: Duration) {
     panic!("file did not appear at {}", path.display());
 }
 
-fn encode_varint_u32(v: u32) -> Vec<u8> {
+pub fn encode_varint_u32(v: u32) -> Vec<u8> {
     if v < 251 {
         vec![v as u8]
     } else if v < 65536 {
@@ -139,14 +139,14 @@ fn encode_varint_u16(v: u16) -> Vec<u8> {
     }
 }
 
-fn frame_message(payload: &[u8]) -> Vec<u8> {
+pub fn frame_message(payload: &[u8]) -> Vec<u8> {
     let len = payload.len() as u32;
     let mut framed = len.to_le_bytes().to_vec();
     framed.extend_from_slice(payload);
     framed
 }
 
-fn decode_varint_u32(payload: &[u8], offset: usize) -> Result<(u32, usize), String> {
+pub fn decode_varint_u32(payload: &[u8], offset: usize) -> Result<(u32, usize), String> {
     if offset >= payload.len() {
         return Err("payload too short for varint".into());
     }

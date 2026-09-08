@@ -5,6 +5,9 @@ pub(crate) struct ClientShellEndpoint {
     pub(crate) endpoint_id: ClientEndpointId,
     pub(crate) label: String,
     pub(crate) status: ClientEndpointStatus,
+    /// The endpoint is online but its transport path is recovering: the
+    /// screen may be stale while input still flows. Presentation only.
+    pub(crate) roaming: bool,
     pub(crate) snapshot: Option<Box<ClientShellSnapshot>>,
     /// Connection generation that produced `snapshot`. `None` is reserved for local tests.
     pub(crate) snapshot_generation: Option<u64>,
@@ -55,6 +58,7 @@ impl ClientShellState {
                     },
                     |endpoint| endpoint.status,
                 ),
+                roaming: previous.is_some_and(|endpoint| endpoint.roaming),
                 snapshot: previous.and_then(|endpoint| endpoint.snapshot.clone()),
                 snapshot_generation: previous.and_then(|endpoint| endpoint.snapshot_generation),
                 agent_recency: previous
@@ -116,6 +120,19 @@ impl ClientShellState {
             .find(|endpoint| &endpoint.endpoint_id == endpoint_id)
         {
             endpoint.status = status;
+            if status != ClientEndpointStatus::Online {
+                endpoint.roaming = false;
+            }
+        }
+    }
+
+    pub(crate) fn set_endpoint_roaming(&mut self, endpoint_id: &ClientEndpointId, roaming: bool) {
+        if let Some(endpoint) = self
+            .endpoints
+            .iter_mut()
+            .find(|endpoint| &endpoint.endpoint_id == endpoint_id)
+        {
+            endpoint.roaming = roaming;
         }
     }
 
@@ -497,10 +514,28 @@ pub(super) fn local_endpoint() -> ClientShellEndpoint {
         endpoint_id: ClientEndpointId::Local,
         label: "Local".into(),
         status: ClientEndpointStatus::Online,
+        roaming: false,
         snapshot: None,
         snapshot_generation: None,
         agent_recency: HashMap::new(),
         agent_presentation: Default::default(),
         methods: None,
     }
+}
+
+/// Sidebar/navigator signal for an endpoint: the status glyph, plus a state
+/// word for anything the user should notice. Online is silent unless the
+/// transport is roaming.
+pub(super) fn endpoint_signal(
+    endpoint: &ClientShellEndpoint,
+    palette: &Palette,
+) -> (String, ratatui::style::Color) {
+    let (glyph, state, color) = endpoint_status_presentation(endpoint.status, palette);
+    if endpoint.status != ClientEndpointStatus::Online {
+        return (format!("{glyph} {state}"), color);
+    }
+    if endpoint.roaming {
+        return (format!("{glyph} roaming"), palette.yellow);
+    }
+    (glyph.to_owned(), color)
 }
