@@ -141,8 +141,15 @@ One ladder run per accepted local connection:
 
 - Obtains a credential (process-wide cache keyed by target+session, else SSH
   `remote-quic-bootstrap`), dials QUIC, sends `RemoteQuicHello`, waits for
-  `RemoteQuicAccepted`. Bootstrap or dial failure → SSH stdio fallback for this
-  connection (the ssh child is the one `SshStdioBridge` spawns today).
+  `RemoteQuicAccepted`. Bootstrap failure → SSH stdio fallback for this
+  connection (the ssh child is the one `SshStdioBridge` spawns today). A dial
+  timeout falls back to SSH only while the credential is unproven (UDP filtered
+  from the start). Once a credential has carried a live session, a timeout is
+  read as an outage: the bridge TCP-probes the SSH port (3 s); nothing answering
+  closes the local socket so the supervisor paces a QUIC-first retry, an
+  answering port earns QUIC exactly one more dial before SSH carries the
+  connection. Without this rule a client whose outage ended during the patient
+  SSH rung stayed on SSH, roaming lost, until its next reconnect.
 - Copies frames between the local Unix socket and the QUIC bidirectional stream,
   frame-aligned (`[u32 LE len][payload]`) so it can inject its own frames, with
   bounded buffers and backpressure in both directions. Payloads are opaque.
@@ -233,28 +240,65 @@ credential cache expiry and generation increment; health deadline 150 s while
 recovering, 10 s otherwise; handoff continuity (`tests/live_handoff.rs`: successor
 keeps instance/port/fingerprint/tokens).
 
-### 8.3 Real-surface scenarios (throwaway named session on a remote host)
+### 8.3 Real-surface scenarios
 
-Recorded outcomes for each: time-to-usable, keystroke loss, redraw correctness.
+Run 2026-09-08 on `feat/quic-endpoint` debug builds: thin client
+`herdr --remote quicrepro --session quicrepro` in a pane of the maintainer's
+session, "remote" = a second local user reached over `ssh 127.0.0.1`
+(`AllowUsers herdr-quic@127.0.0.1`), server QUIC on UDP 48001. Outages via an
+`nft` output chain on `lo` (UDP 48001 both ways; "full" also TCP 22), address
+change by dropping the client's current UDP source port, sleep by
+`SIGSTOP`/`fg` of the launcher and client. Input was typed through the outer
+pane and verified in the remote pane through the remote CLI.
 
-| Scenario | Expected |
-| --- | --- |
-| 3 s UDP blackhole | no visible event |
-| IP change (netns / interface flap) | recovers within one rebind interval, no re-handshake |
-| 30 s blackhole | Roaming shown, input still accepted and delivered on recovery, no reconnect |
-| 120 s blackhole (tunnel) | same as 30 s |
-| 200 s blackhole | Reconnecting at 150 s, input frozen, QUIC re-dial with cached token after restore, zero SSH, full redraw correct |
-| Laptop sleep 10 min | reattached with cached token, zero SSH prompts |
-| Server `--handoff` | QUIC clients re-dial successor without SSH |
-| UDP blocked from start | SSH fallback after one 2 s dial timeout |
-| Screen equivalence after every recovery | client state equals a perfect-connectivity session at the same snapshot/surface revision |
+| Scenario | Expected | Observed |
+| --- | --- | --- |
+| 3 s UDP blackhole | no visible event | no log line, no status change; keystrokes typed during the hole delivered |
+| Interface flap (old address dead) | recovers within one rebind interval, no re-handshake | recovering at +2.4 s, rebind at +10.4 s, live 2 ms later on a new source port; same connection generation; input flows |
+| 30 s blackhole | roaming, input delivered on recovery, no reconnect | recovering at +4 s, live 107 ms after the hole lifted; keystroke typed at +10 s delivered; no reconnect, no toast |
+| 120 s blackhole | same as 30 s | recovering at +7 s, live 1.9 s after lift (slow-probe window); keystroke typed at +60 s delivered; no reconnect |
+| 200 s full outage (UDP + SSH) | reconnecting at 150 s, QUIC re-dial with cached token, zero SSH | lost at +149 s; "Local · reconnecting"; paced retries every 5–13 s (dial 2 s + probe 3 s + supervisor backoff); QUIC connected 9.7 s after restore with the cached token, generation 7, zero SSH sessions; keystroke typed at +100 s lost (in flight when the connection was abandoned) |
+| Sleep 10 min | reattached with cached token, zero SSH | server idle-timed the connection at 180 s; on wake the bridge saw the dead stream, closed local, QUIC reconnected in 866 ms with the cached token; zero SSH; "connection lost" modal cleared on reconnect |
+| Server live handoff | QUIC clients re-dial successor without SSH | successor adopted the UDP sockets (`capabilities=7`); client closed by peer (code 260), re-dialed in 1.08 s, zero SSH, panes preserved. A handoff that failed to spawn (deleted exe) also rolled back cleanly: client re-dialed the old server in 1.07 s |
+| UDP blocked from start | SSH fallback after one 2 s dial | first prompt 3.0 s after launch: bootstrap, 2 s dial timeout, SSH stdio bridge |
+| Screen equivalence | client equals a perfect-connectivity view | after the sleep reconnect every non-empty line of the remote pane (33) appeared verbatim in the thin client's pane region |
+
+Reference: first prompt 0.76 s after launch on QUIC (warm SSH control master,
+loopback). Standalone `--remote` has no endpoint row, so roaming is not visible
+there; saved machines show it in the sidebar.
 
 ### 8.4 Benchmark
 
-Rework `src/remote/benchmark/*` to drive a real server and semantic client
-through the bridge under 3G shaping (1.6/0.75 Mbit, 260–340 ms RTT, ~1% loss)
-and blackout windows. Report fps, bytes/frame, p50/p95/p99 input-to-visible,
-recovery latency, stalled RSS. Numbers go in this document before any are cited.
+`src/remote/benchmark.rs` (`#[ignore]`d test `remote_quic_3g_benchmark`) drives a
+real in-process `HeadlessServer` and a semantic client (`TerminalHello` →
+`AttachTerminal` → `Input`/`Terminal` frames) through the real `QuicBridge` and a
+userspace UDP relay with the 3G profile (1.6/0.75 Mbit, 260–340 ms RTT, 1-in-101
+deterministic loss) and blackout windows. Markers are one letter repeated five
+times so a coalesced diff still changes every cell; the 250 ms gap is measured
+from the echo. `HERDR_BENCH_KEYSTROKES` (default 60), `HERDR_BENCH_REPORT` (JSON).
+
+```
+cargo test --bin herdr -- --ignored --nocapture remote_quic_3g_benchmark
+```
+
+Run 2026-09-08, debug build, loopback; bytes are `Terminal` frame payloads:
+
+| arm | p50 ms | p95 ms | p99 ms | fps | bytes/frame | lost | wall s |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| direct (Unix socket) | 5.1 | 9.8 | 12.9 | 7.80 | 78.0 | 0 | 15.4 |
+| quic_online | 8.2 | 22.5 | 27.0 | 7.80 | 77.6 | 0 | 15.6 |
+| quic_3g | 311.1 | 962.9 | 1015.1 | 3.21 | 78.0 | 0 | 37.0 |
+| quic_3g_blackout | 308.8 | 341.5 | 974.0 | 2.01 | 77.8 | 0 | 61.7 |
+
+| blackout window | recovery ms | mid-blackout keystroke echoed |
+| --- | --- | --- |
+| 5 s | 651 | yes |
+| 20 s | 694 | yes |
+
+The QUIC pipe adds ~3 ms p50 over the Unix socket unshaped and nothing beyond
+one RTT on 3G; the 3G p95/p99 are the deterministic loss events costing a
+retransmit round. fps in the blackout arm is diluted by the 25 s of outage
+inside its wall time.
 
 ## 9. Source inventory from `feat/resumable-quic`
 

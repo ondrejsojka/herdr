@@ -71,6 +71,9 @@ const QUIC_RECONNECT_MAX_DELAY: Duration = Duration::from_secs(4);
 /// Rejected dials tolerated in one run before handing the connection to SSH.
 /// Backoff alone cannot repair a credential the server keeps refusing.
 const MAX_CONSECUTIVE_QUIC_RETRIES: u32 = 5;
+/// TCP connect budget for the SSH reachability probe that decides whether a
+/// QUIC dial timeout means "UDP is filtered" or "the network is down".
+const SSH_REACHABILITY_TIMEOUT: Duration = Duration::from_secs(3);
 /// A cached credential is treated as spent this long before its real deadline,
 /// so a dial started now cannot lose a race against the server's own expiry
 /// check.
@@ -221,6 +224,9 @@ enum LadderStep {
     SshFallback(String),
     /// Close the local socket and let the thin client reconnect.
     CloseLocal(String),
+    /// A dial to a server that has already carried QUIC timed out: check
+    /// whether the SSH port answers before conceding the connection to SSH.
+    ProbeSsh(String),
 }
 
 #[derive(Debug)]
@@ -234,6 +240,12 @@ enum LadderEvent {
     ConnectFailed(ConnectError),
     /// A live session ended.
     SessionEnded(SessionExit),
+    /// The SSH port accepted a TCP connection: the network is up, so a QUIC
+    /// timeout means UDP really is filtered on this path.
+    SshReachable,
+    /// The SSH port did not answer either: the whole network is down, and
+    /// nothing is gained by trying to carry the client over SSH.
+    SshUnreachable(String),
 }
 
 /// Budget spent by one ladder run. A run covers a single local connection, so
@@ -244,6 +256,12 @@ struct LadderState {
     rejected_dials: u32,
     /// Whether this run already minted a fresh credential.
     rebootstrapped: bool,
+    /// Whether the credential in hand has carried a live QUIC session before.
+    /// A proven credential turns a dial timeout from "UDP is filtered here"
+    /// into "the network is probably down", which SSH cannot fix either.
+    credential_proven: bool,
+    /// Whether this run already re-dialed QUIC after the SSH port answered.
+    redialed_after_probe: bool,
 }
 
 /// The ladder, as a pure function of the run's budget and the latest event.
@@ -264,12 +282,30 @@ fn next_step(state: &mut LadderState, event: LadderEvent) -> LadderStep {
         // reuses the cached credential, so it costs no SSH.
         LadderEvent::SessionEnded(exit) => LadderStep::CloseLocal(exit.to_string()),
         // A dial that never reached the server says nothing about the
-        // credential: only the path is suspect, and SSH is the answer to a
-        // path that cannot carry QUIC.
-        LadderEvent::ConnectFailed(ConnectError::Timeout(detail))
-        | LadderEvent::ConnectFailed(ConnectError::Other(detail)) => {
-            LadderStep::SshFallback(detail)
+        // credential: only the path is suspect. On a path that never carried
+        // QUIC, SSH is the answer. On one that did, an outage is far likelier
+        // than a UDP filter appearing mid-session, and conceding to SSH at the
+        // first sign of it would strand the client on SSH for the rest of the
+        // connection the moment the network returns.
+        LadderEvent::ConnectFailed(ConnectError::Timeout(detail)) => {
+            if state.credential_proven && !state.redialed_after_probe {
+                LadderStep::ProbeSsh(detail)
+            } else {
+                LadderStep::SshFallback(detail)
+            }
         }
+        LadderEvent::ConnectFailed(ConnectError::Other(detail)) => LadderStep::SshFallback(detail),
+        // The network is up and UDP still failed: SSH gets one more QUIC dial
+        // to beat before it carries the connection.
+        LadderEvent::SshReachable => {
+            state.redialed_after_probe = true;
+            LadderStep::ConnectQuic {
+                delay: Duration::ZERO,
+            }
+        }
+        // Nothing answers. Give the connection back so the thin client's
+        // supervisor paces the retries; the next one dials QUIC first again.
+        LadderEvent::SshUnreachable(detail) => LadderStep::CloseLocal(detail),
         LadderEvent::ConnectFailed(ConnectError::Rejected(SessionExit::Superseded)) => {
             LadderStep::CloseLocal(SessionExit::Superseded.to_string())
         }
@@ -344,7 +380,7 @@ fn bridge_local_connection(
     match outcome {
         RunOutcome::Done => Ok(()),
         RunOutcome::Ssh { stream, detail } => {
-            debug!(
+            info!(
                 target = %config.target,
                 %detail,
                 "carrying the remote client on the SSH stdio bridge"
@@ -398,6 +434,7 @@ fn run_quic_ladder(
                 match credential(config, &key) {
                     Err(detail) => LadderEvent::BootstrapFailed(detail),
                     Ok(credential) => {
+                        state.credential_proven = credential.proven;
                         match connect_and_pump(
                             &runtime,
                             config,
@@ -421,6 +458,15 @@ fn run_quic_ladder(
             LadderStep::Rebootstrap => match rebootstrap(config, &key, should_stop) {
                 Ok(()) => LadderEvent::Bootstrapped,
                 Err(detail) => LadderEvent::BootstrapFailed(detail),
+            },
+            LadderStep::ProbeSsh(detail) => match ssh_port_reachable(config) {
+                Ok(()) => {
+                    debug!(target = %config.target, %detail, "SSH port answers; re-dialing QUIC once");
+                    LadderEvent::SshReachable
+                }
+                Err(probe) => LadderEvent::SshUnreachable(format!(
+                    "retryable: {detail}; SSH port unreachable too ({probe})"
+                )),
             },
             LadderStep::SshFallback(detail) => {
                 let Some(stream) = local.take() else {
@@ -456,6 +502,7 @@ fn connect_and_pump(
         record,
         candidates,
         generation,
+        proven: _,
     } = credential;
     let params = QuicClientParams {
         candidates,
@@ -493,6 +540,7 @@ fn connect_and_pump(
         generation,
         "remote QUIC transport connected"
     );
+    mark_credential_proven(&credential_key(config));
     let exit = runtime.block_on(run_pump(&session, send, recv, stream, should_stop));
     session.close(CLOSE_BRIDGE_DONE, b"bridge done");
 
@@ -708,6 +756,7 @@ where
                     return PumpExit::Ended("remote QUIC stream ended".to_owned());
                 }
                 if let Some(state) = monitor.received(Instant::now()) {
+                    info!(?state, "remote QUIC path recovered");
                     if let Err(detail) = announce_transport_state(local_write, state).await {
                         return PumpExit::Ended(detail);
                     }
@@ -727,8 +776,9 @@ where
                     monitor.probe_sent(now);
                 }
                 if outcome.rebind {
-                    if let Err(detail) = session.rebind() {
-                        debug!(%detail, "remote QUIC socket rebind failed");
+                    match session.rebind() {
+                        Ok(()) => info!("remote QUIC socket rebound"),
+                        Err(detail) => debug!(%detail, "remote QUIC socket rebind failed"),
                     }
                 }
                 match outcome.transition {
@@ -739,6 +789,7 @@ where
                         ));
                     }
                     Some(state) => {
+                        info!(?state, "remote QUIC path silent; recovering");
                         if let Err(detail) = announce_transport_state(local_write, state).await {
                             return PumpExit::Ended(detail);
                         }
@@ -824,6 +875,8 @@ struct Credential {
     candidates: Vec<SocketAddr>,
     /// Connection generation this dial presents.
     generation: u64,
+    /// Whether this credential has carried a live QUIC session before.
+    proven: bool,
 }
 
 struct CachedCredential {
@@ -832,6 +885,8 @@ struct CachedCredential {
     /// Generation the next dial will present. Monotonic per credential, so the
     /// server fences the older connection out when a redial replaces it.
     next_connection_generation: u64,
+    /// Set once a dial with this credential reached a live session.
+    proven: bool,
 }
 
 /// Keyed by target and session, which is exactly what the token is scoped to.
@@ -869,6 +924,7 @@ fn reserve_cached_credential(
         record: entry.record.clone(),
         candidates: entry.candidates.clone(),
         generation,
+        proven: entry.proven,
     })
 }
 
@@ -884,12 +940,42 @@ fn store_credential(
             record,
             candidates,
             next_connection_generation: 1,
+            proven: false,
         },
     );
 }
 
+fn mark_credential_proven(key: &CredentialKey) {
+    if let Some(entry) = lock(&CREDENTIAL_CACHE).get_mut(key) {
+        entry.proven = true;
+    }
+}
+
 fn drop_credential(key: &CredentialKey) {
     lock(&CREDENTIAL_CACHE).remove(key);
+}
+
+/// Plant a credential so the next local connection dials QUIC straight away.
+/// Lets a test drive the real ladder — dial, pump, path monitor — without an
+/// SSH round trip, and lets it point the dial at a shaped relay instead of the
+/// port the server actually published.
+#[cfg(test)]
+pub(super) fn seed_credential_for_test(
+    config: &QuicBridgeConfig,
+    record: RemoteBootstrapRecord,
+    candidates: Vec<SocketAddr>,
+) {
+    store_credential(
+        &mut lock(&CREDENTIAL_CACHE),
+        credential_key(config),
+        record,
+        candidates,
+    );
+}
+
+#[cfg(test)]
+pub(super) fn forget_credential_for_test(config: &QuicBridgeConfig) {
+    drop_credential(&credential_key(config));
 }
 
 /// Reserve a dial's worth of credential, minting one over SSH when the cache
@@ -1025,19 +1111,50 @@ fn bootstrap_failed(output: &Output) -> io::Error {
 /// Resolve the target's real hostname the way OpenSSH does, so QUIC dials the
 /// host the SSH session actually reached rather than an alias.
 fn resolve_ssh_hostname(config: &QuicBridgeConfig) -> io::Result<String> {
+    resolve_ssh_endpoint(config).map(|(hostname, _)| hostname)
+}
+
+/// The host and port OpenSSH would actually connect to for `config.target`.
+fn resolve_ssh_endpoint(config: &QuicBridgeConfig) -> io::Result<(String, u16)> {
     let mut command = Command::new("ssh");
     apply_managed_ssh_options(&mut command, config.ssh_options.as_ref());
     let output = command.arg("-G").arg(&config.target).output()?;
     if !output.status.success() {
         return Err(command_failed("failed to resolve SSH target", &output));
     }
-    String::from_utf8_lossy(&output.stdout)
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let hostname = stdout
         .lines()
         .find_map(|line| line.strip_prefix("hostname "))
         .map(str::trim)
         .filter(|hostname| !hostname.is_empty())
         .map(str::to_owned)
-        .ok_or_else(|| io::Error::other("ssh -G did not report a hostname"))
+        .ok_or_else(|| io::Error::other("ssh -G did not report a hostname"))?;
+    let port = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("port "))
+        .and_then(|port| port.trim().parse::<u16>().ok())
+        .unwrap_or(22);
+    Ok((hostname, port))
+}
+
+/// Whether the SSH port completes a TCP handshake inside
+/// [`SSH_REACHABILITY_TIMEOUT`]. Distinguishes a filtered UDP path (SSH
+/// answers) from a dead network (nothing answers) without spawning ssh or
+/// authenticating.
+fn ssh_port_reachable(config: &QuicBridgeConfig) -> io::Result<()> {
+    let (hostname, port) = resolve_ssh_endpoint(config)?;
+    let mut last_error = io::Error::new(
+        io::ErrorKind::AddrNotAvailable,
+        format!("SSH hostname {hostname} has no IP addresses"),
+    );
+    for address in (hostname.as_str(), port).to_socket_addrs()? {
+        match std::net::TcpStream::connect_timeout(&address, SSH_REACHABILITY_TIMEOUT) {
+            Ok(_) => return Ok(()),
+            Err(err) => last_error = err,
+        }
+    }
+    Err(last_error)
 }
 
 fn remote_quic_candidates(hostname: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
@@ -1219,6 +1336,53 @@ mod tests {
                 LadderEvent::BootstrapFailed("unknown subcommand".to_owned())
             ),
             LadderStep::SshFallback("unknown subcommand".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_proven_path_checks_ssh_before_conceding_to_it() {
+        let mut state = LadderState {
+            credential_proven: true,
+            ..LadderState::default()
+        };
+        let timeout = || LadderEvent::ConnectFailed(ConnectError::Timeout("no answer".to_owned()));
+        // Network down: nothing answers, so hand the connection back for a
+        // paced retry instead of stranding it on SSH once the network returns.
+        assert_eq!(
+            next_step(&mut state, timeout()),
+            LadderStep::ProbeSsh("no answer".to_owned())
+        );
+        assert_eq!(
+            next_step(&mut state, LadderEvent::SshUnreachable("down".to_owned())),
+            LadderStep::CloseLocal("down".to_owned())
+        );
+
+        // UDP filtered: the SSH port answers, QUIC gets exactly one more dial,
+        // and a second timeout concedes the connection to SSH.
+        let mut state = LadderState {
+            credential_proven: true,
+            ..LadderState::default()
+        };
+        assert!(matches!(
+            next_step(&mut state, timeout()),
+            LadderStep::ProbeSsh(_)
+        ));
+        assert_eq!(
+            next_step(&mut state, LadderEvent::SshReachable),
+            LadderStep::ConnectQuic {
+                delay: Duration::ZERO
+            }
+        );
+        assert_eq!(
+            next_step(&mut state, timeout()),
+            LadderStep::SshFallback("no answer".to_owned())
+        );
+
+        // A credential that never carried QUIC keeps the plain fallback.
+        let mut fresh = LadderState::default();
+        assert_eq!(
+            next_step(&mut fresh, timeout()),
+            LadderStep::SshFallback("no answer".to_owned())
         );
     }
 

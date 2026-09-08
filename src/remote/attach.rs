@@ -30,6 +30,9 @@ const PREVIEW_UPDATE_MANIFEST_URL: &str = "https://herdr.dev/preview.json";
 const REMOTE_BINARY_ENV_VAR: &str = "HERDR_REMOTE_BINARY";
 const SSH_CONTROL_SOCKET_NAME: &str = "ctl";
 pub(crate) fn run_remote(remote: RemoteLaunch) -> io::Result<()> {
+    // The launcher owns the SSH bootstrap and the QUIC bridge; without a file
+    // sink their transport events (ladder steps, roaming, fallback) vanish.
+    crate::logging::init_file_logging("herdr-remote.log");
     let session_name = crate::session::active_name()
         .unwrap_or_else(|| crate::session::DEFAULT_SESSION_NAME.to_string());
     let local_socket = local_forward_socket_path(&remote.target, &session_name);

@@ -67,7 +67,8 @@ Removing or disabling the machine you are viewing returns you to Local. If Local
 
 ## Connection problems
 
-- **Reconnecting:** Herdr retries with bounded backoff after a network interruption, sleep, or SSH failure. SSH connections are checked for application-level activity and probed when quiet, so a broken connection does not stay Online indefinitely. Local detects native connection closure or failure instead of using remote health probes.
+- **Roaming:** On Linux and macOS clients the live connection to a saved machine runs over [SSH-bootstrapped QUIC](/docs/persistence-remote/#roaming-over-quic) when the server supports it. Roaming means that path is silent (a tunnel, a network switch, a closed lid) but not yet given up: the screen stays live, input keeps flowing, and the client rebinds as your address changes. It returns to Online by itself; only after 150 seconds of silence does it become Reconnecting.
+- **Reconnecting:** Herdr retries with bounded backoff after a network interruption, sleep, or SSH failure. A QUIC connection reconnects with its cached credential and no new SSH session; while the network is down it keeps trying QUIC first rather than settling on SSH. SSH connections are checked for application-level activity and probed when quiet, so a broken connection does not stay Online indefinitely. Local detects native connection closure or failure instead of using remote health probes.
 - **Attention:** The target needs an action that cannot be completed in the background, such as host-key approval, authentication, or a compatible server. Other machines remain usable.
 - **Saved-machine file error:** An unreadable or invalid catalog leaves current connections unchanged. Herdr shows a notice and automatically retries reading it.
 

@@ -1,5 +1,7 @@
 mod args;
 mod attach;
+#[cfg(all(test, unix))]
+mod benchmark;
 #[cfg(unix)]
 pub(crate) mod frame;
 #[cfg(unix)]
