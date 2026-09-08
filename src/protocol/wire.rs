@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 // ---------------------------------------------------------------------------
 
 /// Current protocol version. Bumped when wire format changes incompatibly.
-pub const PROTOCOL_VERSION: u32 = 22;
+pub const PROTOCOL_VERSION: u32 = 23;
 
 /// Maximum allowed frame payload size (2 MB). Frames larger than this are
 /// rejected to prevent denial-of-service via oversized length prefixes.
@@ -30,6 +30,20 @@ pub const MAX_GRAPHICS_FRAME_SIZE: usize = 32 * 1024 * 1024;
 
 /// Maximum clipboard image payload size for remote paste bridging.
 pub const MAX_CLIPBOARD_IMAGE_PAYLOAD: usize = 16 * 1024 * 1024;
+
+/// Schema version of the SSH-delivered QUIC bootstrap record and of the QUIC
+/// hello. Independent of `PROTOCOL_VERSION`: client and server builds may
+/// differ, and the QUIC pipe carries whatever protocol they negotiate.
+pub const REMOTE_QUIC_SCHEMA_VERSION: u32 = 1;
+/// QUIC application protocol negotiated during the TLS handshake.
+#[cfg(unix)]
+pub const REMOTE_QUIC_ALPN: &[u8] = b"herdr/1";
+/// Capability token length in bytes.
+pub const REMOTE_QUIC_TOKEN_BYTES: usize = 32;
+/// Stable process-instance and logical-client identifier length in bytes.
+pub const REMOTE_QUIC_ID_BYTES: usize = 16;
+/// SHA-256 certificate fingerprint length in bytes.
+pub const REMOTE_QUIC_HASH_BYTES: usize = 32;
 
 /// Length of the u32 little-endian length prefix in bytes.
 const LENGTH_PREFIX_BYTES: usize = 4;
@@ -462,6 +476,76 @@ impl ClientInputEvent {
     }
 }
 
+/// SSH-authenticated request to lazily enable the server's QUIC endpoint.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteBootstrapRequest {
+    pub session: String,
+    pub logical_client_id: [u8; REMOTE_QUIC_ID_BYTES],
+}
+
+/// Process-lifetime QUIC authority returned over the authenticated SSH path.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteBootstrapRecord {
+    pub schema_version: u32,
+    pub server_instance_id: [u8; REMOTE_QUIC_ID_BYTES],
+    pub port: u16,
+    pub certificate_fingerprint: [u8; REMOTE_QUIC_HASH_BYTES],
+    pub capability_token: [u8; REMOTE_QUIC_TOKEN_BYTES],
+    pub expires_unix_seconds: u64,
+}
+
+impl std::fmt::Debug for RemoteBootstrapRecord {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RemoteBootstrapRecord")
+            .field("schema_version", &self.schema_version)
+            .field("server_instance_id", &self.server_instance_id)
+            .field("port", &self.port)
+            .field("certificate_fingerprint", &self.certificate_fingerprint)
+            .field("capability_token", &"<redacted>")
+            .field("expires_unix_seconds", &self.expires_unix_seconds)
+            .finish()
+    }
+}
+
+/// Authenticating first frame on a fresh QUIC stream. Everything after the
+/// server's [`RemoteQuicAccepted`] reply is the ordinary framed client
+/// protocol, opaque to the transport.
+#[cfg(unix)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteQuicHello {
+    pub schema_version: u32,
+    pub server_instance_id: [u8; REMOTE_QUIC_ID_BYTES],
+    pub logical_client_id: [u8; REMOTE_QUIC_ID_BYTES],
+    pub capability_token: [u8; REMOTE_QUIC_TOKEN_BYTES],
+    /// Monotonic per-credential fence; the server accepts only a generation
+    /// newer than the last one it saw for this token.
+    pub connection_generation: u64,
+}
+
+#[cfg(unix)]
+impl std::fmt::Debug for RemoteQuicHello {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RemoteQuicHello")
+            .field("schema_version", &self.schema_version)
+            .field("server_instance_id", &self.server_instance_id)
+            .field("logical_client_id", &self.logical_client_id)
+            .field("capability_token", &"<redacted>")
+            .field("connection_generation", &self.connection_generation)
+            .finish()
+    }
+}
+
+/// Server reply to [`RemoteQuicHello`]; a rejected hello closes the
+/// connection with a `quic_policy` close code instead.
+#[cfg(unix)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteQuicAccepted {
+    pub schema_version: u32,
+    pub connection_generation: u64,
+}
+
 /// Messages sent from the client to the server over the client protocol socket.
 ///
 /// Variant order is frozen for endpoint generation 1. Add compatible endpoint
@@ -620,6 +704,9 @@ pub enum ClientMessage {
     /// This variant is append-only. Its bincode tag and two-string payload are part
     /// of endpoint generation 1 and must not change.
     EndpointControl { kind: String, data: String },
+
+    /// Private SSH bootstrap request. Accepted only as the first local-socket message.
+    RemoteBootstrap(RemoteBootstrapRequest),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1446,6 +1533,12 @@ pub enum ServerMessage {
     /// This variant is append-only. Its bincode tag and two-string payload are part
     /// of endpoint generation 1 and must not change.
     EndpointControl { kind: String, data: String },
+
+    /// Private response to a local SSH bootstrap helper.
+    RemoteBootstrap {
+        record: Option<RemoteBootstrapRecord>,
+        error: Option<String>,
+    },
 }
 
 // ---------------------------------------------------------------------------

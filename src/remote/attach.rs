@@ -570,7 +570,7 @@ impl Drop for RemoteSsh {
     }
 }
 
-fn apply_noninteractive_ssh_options(command: &mut Command) {
+pub(super) fn apply_noninteractive_ssh_options(command: &mut Command) {
     command
         .arg("-o")
         .arg("BatchMode=yes")
@@ -588,7 +588,10 @@ fn apply_noninteractive_ssh_options(command: &mut Command) {
         .arg("ServerAliveCountMax=4");
 }
 
-fn apply_managed_ssh_options(command: &mut Command, options: Option<&ManagedSshOptions>) {
+pub(super) fn apply_managed_ssh_options(
+    command: &mut Command,
+    options: Option<&ManagedSshOptions>,
+) {
     let Some(options) = options else {
         return;
     };
@@ -1724,7 +1727,11 @@ fn confirm_remote_install(
     Ok(())
 }
 
-fn remote_session_command(remote_herdr: &RemoteHerdr, session_name: &str, args: &str) -> String {
+pub(super) fn remote_session_command(
+    remote_herdr: &RemoteHerdr,
+    session_name: &str,
+    args: &str,
+) -> String {
     let mut command = remote_herdr.shell_path.clone();
     if session_name != crate::session::DEFAULT_SESSION_NAME {
         command.push_str(" --session ");
@@ -1766,7 +1773,7 @@ fn reattach_command(
     command
 }
 
-fn command_failed(context: &str, output: &Output) -> io::Error {
+pub(super) fn command_failed(context: &str, output: &Output) -> io::Error {
     let stderr = String::from_utf8_lossy(&output.stderr);
     let stderr = stderr.trim();
     if stderr.is_empty() {
@@ -1941,7 +1948,7 @@ fn write_managed_ssh_config() -> io::Result<ManagedSshConfig> {
     })
 }
 
-fn bridge_connection(
+pub(super) fn bridge_connection(
     stream: crate::ipc::LocalStream,
     target: &str,
     remote_herdr: &RemoteHerdr,

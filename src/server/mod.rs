@@ -15,6 +15,8 @@ pub mod headless;
 pub(crate) mod keybindings;
 pub(crate) mod notifications;
 pub(crate) mod pane_input;
+#[cfg(unix)]
+pub(crate) mod remote_quic;
 #[cfg(test)]
 mod render_scale_benchmark;
 pub(crate) mod render_stream;

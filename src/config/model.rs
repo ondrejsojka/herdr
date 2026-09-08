@@ -1017,19 +1017,64 @@ pub struct AdvancedConfig {
     pub scrollback_limit_bytes: usize,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum RemoteTransportConfig {
+    /// SSH-bootstrapped QUIC when the server offers it, SSH stdio bridge otherwise.
+    #[default]
+    Auto,
+    /// SSH stdio bridge only; never bootstraps or dials QUIC.
+    Ssh,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct RemoteConfig {
+    /// Live transport for remote clients. Default: auto.
+    pub transport: RemoteTransportConfig,
     /// Add keepalive fallbacks and private connection reuse for `herdr --remote`.
     /// Set false to run plain ssh unchanged. Default: true.
     pub manage_ssh_config: bool,
+    /// Inclusive unprivileged UDP port range used by the lazy QUIC listener.
+    pub quic_port_range: String,
+    /// How long an SSH-minted QUIC credential stays valid for fresh
+    /// reconnects without re-running SSH. Default: 86400 seconds.
+    pub quic_idle_timeout_seconds: u64,
+    /// How long a silent QUIC connection is kept before the server declares
+    /// it dead. Default: 180 seconds, longer than the client's 150 s roaming
+    /// grace so a tunnel-length blackhole migrates instead of reconnecting.
+    pub quic_transport_idle_timeout_seconds: u64,
 }
 
 impl Default for RemoteConfig {
     fn default() -> Self {
         Self {
+            transport: RemoteTransportConfig::Auto,
             manage_ssh_config: true,
+            quic_port_range: "48000-48100".to_owned(),
+            quic_idle_timeout_seconds: 86_400,
+            quic_transport_idle_timeout_seconds: 180,
         }
+    }
+}
+
+/// Smallest and largest accepted `remote.quic_transport_idle_timeout_seconds`.
+///
+/// Below 10s a normal stall on a mobile path would tear the connection down
+/// faster than the client can probe it; above 600s a dead peer would hold
+/// server-side state for ten minutes.
+pub const REMOTE_TRANSPORT_IDLE_TIMEOUT_MIN_SECONDS: u64 = 10;
+pub const REMOTE_TRANSPORT_IDLE_TIMEOUT_MAX_SECONDS: u64 = 600;
+
+impl RemoteConfig {
+    /// Clamp `remote.quic_transport_idle_timeout_seconds` into the supported
+    /// window instead of letting a typo produce a transport that never times
+    /// out or dies instantly.
+    pub fn validated_transport_idle_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.quic_transport_idle_timeout_seconds.clamp(
+            REMOTE_TRANSPORT_IDLE_TIMEOUT_MIN_SECONDS,
+            REMOTE_TRANSPORT_IDLE_TIMEOUT_MAX_SECONDS,
+        ))
     }
 }
 

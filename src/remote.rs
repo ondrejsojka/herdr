@@ -1,8 +1,16 @@
 mod args;
 mod attach;
 #[cfg(unix)]
+pub(crate) mod frame;
+#[cfg(unix)]
 mod host_unix;
 mod process;
+#[cfg(unix)]
+mod quic;
+#[cfg(unix)]
+mod quic_bridge;
+#[cfg(unix)]
+pub(crate) mod quic_policy;
 mod restart_policy;
 mod saved;
 

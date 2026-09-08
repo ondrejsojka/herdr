@@ -393,6 +393,17 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # resume_agents_on_restore = true
 
 [remote]
+# Live transport for remote clients: auto (SSH-bootstrapped QUIC when the
+# server offers it, SSH stdio bridge otherwise) or ssh.
+# transport = "auto"
+# Inclusive UDP range for the lazy, per-server-process QUIC listener.
+# quic_port_range = "48000-48100"
+# How long an SSH-minted QUIC credential stays valid for fresh reconnects
+# without re-running SSH.
+# quic_idle_timeout_seconds = 86400
+# How long a silent QUIC connection is kept before the server declares it
+# dead (10-600).
+# quic_transport_idle_timeout_seconds = 180
 # Whether herdr manages the ssh config used for `herdr --remote`.
 # When true (default), herdr runs remote ssh through a generated config that
 # includes your ~/.ssh/config first and adds ServerAliveInterval/

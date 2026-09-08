@@ -1352,6 +1352,14 @@ fn client_read_loop_with_endpoint_controls(
                 // Duplicate handshake — ignore.
                 continue;
             }
+            ClientMessage::RemoteBootstrap(_) => {
+                // Only valid as the first message on a fresh local socket.
+                debug!(
+                    client_id,
+                    "ignoring remote bootstrap request after handshake"
+                );
+                continue;
+            }
         };
 
         if server_event_tx.blocking_send(event).is_err() {

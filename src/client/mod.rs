@@ -1916,6 +1916,9 @@ async fn run_client_loop(
                     ServerMessage::Welcome { .. } => {
                         debug!("received unexpected Welcome in main loop");
                     }
+                    ServerMessage::RemoteBootstrap { .. } => {
+                        debug!("received remote bootstrap response outside a bootstrap helper");
+                    }
                 }
             }
             ClientLoopEvent::ServerDisconnected {
